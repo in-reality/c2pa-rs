@@ -3191,7 +3191,6 @@ impl Store {
 
         if is_bmff {
             // 2) Get hash ranges if needed, do not generate for update manifests
-            let mut needs_hash = false;
             if !pc.update_manifest() && pc.bmff_hash_assertions().is_empty() {
                 intermediate_stream.rewind()?;
                 let mut bmff_hash = Store::generate_bmff_data_hash_for_stream(pc.alg())?;
@@ -3224,8 +3223,6 @@ impl Store {
                     intermediate_stream = temp_stream;
                 }
                 pc.add_assertion(&bmff_hash)?;
-
-                needs_hash = true;
             }
 
             // 3) Generate in memory CAI jumbf block
@@ -3249,7 +3246,7 @@ impl Store {
             if !pc.update_manifest() {
                 let bmff_hashes = pc.bmff_hash_assertions();
 
-                if !bmff_hashes.is_empty() && needs_hash {
+                if !bmff_hashes.is_empty() {
                     let mut bmff_hash = BmffHash::from_assertion(bmff_hashes[0].assertion())?;
 
                     output_stream.rewind()?;
