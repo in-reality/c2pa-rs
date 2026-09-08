@@ -9,6 +9,621 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+## [0.90.19](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.18...c2pa-v0.90.19)
+_04 September 2026_
+
+### Fixed
+
+* Handling ingredient manifest label collisions (spec v2.4, 18.16.12) (backport #2585) ([#2595](https://github.com/contentauth/c2pa-rs/pull/2595))
+
+## [0.90.18](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.17...c2pa-v0.90.18)
+_04 September 2026_
+
+### Fixed
+
+* Harden against invalid  labels as CAWG identity hard bindings (backport #2538) ([#2581](https://github.com/contentauth/c2pa-rs/pull/2581))
+
+## [0.90.17](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.16...c2pa-v0.90.17)
+_03 September 2026_
+
+### Fixed
+
+* Merge vulnerability fixes ([#2579](https://github.com/contentauth/c2pa-rs/pull/2579))
+* Do not log::error! validation error when hashed URI is dangling, instead log::debug! (backport #2555) ([#2565](https://github.com/contentauth/c2pa-rs/pull/2565))
+
+## [0.90.16](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.15...c2pa-v0.90.16)
+_27 August 2026_
+
+### Added
+
+* Add `Error::AssertionEncoding` error source to error message (backport #2544) ([#2549](https://github.com/contentauth/c2pa-rs/pull/2549))
+
+### Fixed
+
+* Remove `validationResults` requires `activeManifest` when serializing v3 ingredients (backport #2429) ([#2537](https://github.com/contentauth/c2pa-rs/pull/2537))
+* Remove dbg! call used for testing (backport #2551) ([#2552](https://github.com/contentauth/c2pa-rs/pull/2552))
+* Filter functions did not consider `ingredient` parameter (backport #2541) ([#2546](https://github.com/contentauth/c2pa-rs/pull/2546))
+* Reject BMFF Merkle map location that overflows u32 chunk index (CAI-12884) (backport #2445) ([#2500](https://github.com/contentauth/c2pa-rs/pull/2500))
+
+## [0.90.15](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.14...c2pa-v0.90.15)
+_13 August 2026_
+
+### Fixed
+
+* Hardening against potential deep recursion in update manifests with parent cycles (backport #2493) ([#2501](https://github.com/contentauth/c2pa-rs/pull/2501))
+
+## [0.90.14](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.13...c2pa-v0.90.14)
+_13 August 2026_
+
+### Fixed
+
+* Diamond inputTo manifest exponential reverifications depending on ingredient paths reachability (backport #2492) ([#2498](https://github.com/contentauth/c2pa-rs/pull/2498))
+
+## [0.90.13](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.12...c2pa-v0.90.13)
+_13 August 2026_
+
+### Fixed
+
+* *(sdk)* Parse PEM cert chain to DER for RemoteSigner (backport #2414) ([#2481](https://github.com/contentauth/c2pa-rs/pull/2481))
+
+## [0.90.12](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.11...c2pa-v0.90.12)
+_12 August 2026_
+
+### Fixed
+
+* Preserve identity assertions in split-signing paths (backport #2421) ([#2465](https://github.com/contentauth/c2pa-rs/pull/2465))
+* Avoid QoS runtime detection warning (backport #2467) ([#2482](https://github.com/contentauth/c2pa-rs/pull/2482))
+* *(sdk)* Validate inputTo ingredients against manifest tampering (#2… ([#2476](https://github.com/contentauth/c2pa-rs/pull/2476))
+
+### Updated dependencies
+
+* Bump sha1 from 0.10.7 to 0.11.0 (backport #2456) ([#2473](https://github.com/contentauth/c2pa-rs/pull/2473))
+
+## [0.90.11](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.10...c2pa-v0.90.11)
+_12 August 2026_
+
+### Fixed
+
+* *(sdk)* Prevent panic on out-of-range timestamp in GeneralizedTime conversion (backport #2469) ([#2474](https://github.com/contentauth/c2pa-rs/pull/2474))
+
+## [0.90.10](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.9...c2pa-v0.90.10)
+_10 August 2026_
+
+### Fixed
+
+* Relax field restriction requirements on ingredients (backport #2450) ([#2458](https://github.com/contentauth/c2pa-rs/pull/2458))
+* `created` and `kind` flags should roundtrip in Builder archives (backport #2460) ([#2464](https://github.com/contentauth/c2pa-rs/pull/2464))
+
+## [0.90.9](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.8...c2pa-v0.90.9)
+_10 August 2026_
+
+### Added
+
+* *(sdk)* Read support for c2md (JUMBF data) manifests (backport #2380) ([#2461](https://github.com/contentauth/c2pa-rs/pull/2461))
+
+## [0.90.8](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.7...c2pa-v0.90.8)
+_07 August 2026_
+
+### Fixed
+
+* Ensure inception action is only auto-added once (backport #2438) ([#2444](https://github.com/contentauth/c2pa-rs/pull/2444))
+* Chain resources in `Builder::add_ingredient_from_stream` (backport #2432) ([#2442](https://github.com/contentauth/c2pa-rs/pull/2442))
+
+## [0.90.7](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.6...c2pa-v0.90.7)
+_07 August 2026_
+
+### Fixed
+
+* Gate lopdf's rayon feature by real thread availability (backport #2428) ([#2439](https://github.com/contentauth/c2pa-rs/pull/2439))
+
+## [0.90.6](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.5...c2pa-v0.90.6)
+_06 August 2026_
+
+### Fixed
+
+* *(sdk)* Reject did:web documents whose id doesn't match the requested DID (backport #2411) ([#2427](https://github.com/contentauth/c2pa-rs/pull/2427))
+* Upgrade lopdf to 0.44.0 and drop ttf-parser advisory exemption (backport #2417) ([#2418](https://github.com/contentauth/c2pa-rs/pull/2418))
+
+## [0.90.5](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.4...c2pa-v0.90.5)
+_05 August 2026_
+
+### Fixed
+
+* Make sure the closure variables are evaluated at the right time in filter_ingredients (unstable_builder_filter) (backport #2413) ([#2415](https://github.com/contentauth/c2pa-rs/pull/2415))
+* Integer underflow panic in read_desc_box via JUMD toggle-driven field size mismatch (backport #2334) ([#2385](https://github.com/contentauth/c2pa-rs/pull/2385))
+
+## [0.90.4](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.3...c2pa-v0.90.4)
+_04 August 2026_
+
+### Added
+
+* New builder method to combine filtering of actions and ingredients ([#2379](https://github.com/contentauth/c2pa-rs/pull/2379)) ([#2401](https://github.com/contentauth/c2pa-rs/pull/2401))
+
+### Documented
+
+* Doc how to generate bench fixtures (backport #2366) ([#2370](https://github.com/contentauth/c2pa-rs/pull/2370))
+
+### Fixed
+
+* Make URI checks for (data)boxes when going through redactions mo… ([#2404](https://github.com/contentauth/c2pa-rs/pull/2404))
+* Remove archive assertions when constructing builder from archive (backport #2374) ([#2408](https://github.com/contentauth/c2pa-rs/pull/2408))
+* Thumbnails silently dropped when format string has uppercase mimetype (backport #2365) ([#2407](https://github.com/contentauth/c2pa-rs/pull/2407))
+* Unify partially-applied feature name change
+* Replace mp4 crate with hardened native BMFF sample reader (CAI-12277) (backport #2357) ([#2402](https://github.com/contentauth/c2pa-rs/pull/2402))
+* Reject timed-media BMFF Merkle maps that verify against no track (backport #2369) ([#2400](https://github.com/contentauth/c2pa-rs/pull/2400))
+* Validate c2pa.translated action for source and target languages params (backport #2378) ([#2393](https://github.com/contentauth/c2pa-rs/pull/2393))
+* Harden against integer underflow attacks in  ID3 v2.3 frame decoder (backport #2284) ([#2389](https://github.com/contentauth/c2pa-rs/pull/2389))
+
+### Other
+
+**IMPORTANT:** An experimental feature was renamed from `experimental_builder_filter` to `unstable_builder_filter`. Strictly speaking in Rust SemVer, this is a breaking change, but since it was previously expressed that experimental features were exempt from SemVer, we decided not to bump the version.
+
+## [0.90.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.2...c2pa-v0.90.3)
+_24 July 2026_
+
+### Fixed
+
+* Harden against integer overflow attacks in exclusion subsets checks in BMFF hash processing (backport #2359) ([#2360](https://github.com/contentauth/c2pa-rs/pull/2360))
+
+## [0.90.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.1...c2pa-v0.90.2)
+_23 July 2026_
+
+### Fixed
+
+* Reject loopback and DNS-rebinding hosts in did:web resolution (CAI-10364) (backport #2349) ([#2353](https://github.com/contentauth/c2pa-rs/pull/2353))
+* Harden against memory amplification attacks in copy of strip, tile and big table of TIFF file (backport #2282) ([#2348](https://github.com/contentauth/c2pa-rs/pull/2348))
+
+## [0.90.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.90.0...c2pa-v0.90.1)
+_21 July 2026_
+
+### Added
+
+* *(sdk)* Gate Builder action/ingredient filtering behind experimental feature flag (backport #2340) ([#2342](https://github.com/contentauth/c2pa-rs/pull/2342))
+* *(sdk)* Add Builder action/ingredient removal API (backport #2281) ([#2337](https://github.com/contentauth/c2pa-rs/pull/2337))
+
+### Fixed
+
+* Terminate crJSON b64' byte-string values with closing quote (backport #2333) ([#2339](https://github.com/contentauth/c2pa-rs/pull/2339))
+* Repair broken intra-doc link in Settings doc comment (backport #2331) ([#2332](https://github.com/contentauth/c2pa-rs/pull/2332))
+* Harden against arbitrary Local file read and exfiltration via manifest relative path traversal attacks (backport #2271) ([#2326](https://github.com/contentauth/c2pa-rs/pull/2326))
+* Support additional MP3 mime_types for compatibility (backport #2320) ([#2325](https://github.com/contentauth/c2pa-rs/pull/2325))
+
+## [0.90.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.3...c2pa-v0.90.0)
+_16 July 2026_
+
+### Changed
+
+* Transition release onto the new scheduled breaking-change release train (see [release process](https://github.com/contentauth/c2pa-rs/blob/main/docs/release-process.md)). This is a version-only bump: there are no `c2pa` library code changes since 0.89.3 ([#2250](https://github.com/contentauth/c2pa-rs/pull/2250)).
+
+## [0.89.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.2...c2pa-v0.89.3)
+_13 July 2026_
+
+### Documented
+
+* Fix docs build, take 2 ([#2297](https://github.com/contentauth/c2pa-rs/pull/2297))
+* Fix docs build ([#2296](https://github.com/contentauth/c2pa-rs/pull/2296))
+
+### Fixed
+
+* Harden against integer underflow attacks in PNG iTxt chunks XMP parsing ([#2274](https://github.com/contentauth/c2pa-rs/pull/2274))
+* Harden against integer overflow attacks in BMFF parser ([#2280](https://github.com/contentauth/c2pa-rs/pull/2280))
+* Resource_to_stream returns error for unknown resource URIs instead of manifest JUMBF ([#2289](https://github.com/contentauth/c2pa-rs/pull/2289)) ([#2290](https://github.com/contentauth/c2pa-rs/pull/2290))
+
+## [0.89.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.1...c2pa-v0.89.2)
+_09 July 2026_
+
+### Fixed
+
+* Bind OCSP response certId to the signing certificate (CAI-11829) ([#2273](https://github.com/contentauth/c2pa-rs/pull/2273))
+* Fix new Clippy warnings for Rust 1.97.0 ([#2279](https://github.com/contentauth/c2pa-rs/pull/2279))
+* Ensure created has a dst and don't add parent when actions already exist ([#2264](https://github.com/contentauth/c2pa-rs/pull/2264))
+* Integer overflow panic in bmff_to_jumbf_exclusions via DataMap offset addition ([#2263](https://github.com/contentauth/c2pa-rs/pull/2263))
+
+## [0.89.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.89.0...c2pa-v0.89.1)
+_07 July 2026_
+
+### Documented
+
+* Update README.md doc links ([#2261](https://github.com/contentauth/c2pa-rs/pull/2261))
+
+### Fixed
+
+* Resolve crate audit advisories (lopdf, quick-xml, crossbeam-epoch, ttf-parser) ([#2268](https://github.com/contentauth/c2pa-rs/pull/2268))
+* Don't serialize empty values ([#2254](https://github.com/contentauth/c2pa-rs/pull/2254))
+* CAI-10364 (Server-Side Request Forgery (SSRF) via CAWG did:web Resolution during Post-Validation ) ([#2168](https://github.com/contentauth/c2pa-rs/pull/2168))
+
+### Other
+
+* Lazy load all ingredient resources & remove old to_archive zip format. ([#2173](https://github.com/contentauth/c2pa-rs/pull/2173))
+
+## [0.89.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.88.0...c2pa-v0.89.0)
+_19 June 2026_
+
+### Added
+
+* Add source to `HttpResolverError::Other` error message ([#2237](https://github.com/contentauth/c2pa-rs/pull/2237))
+* Auto format detect for Reader ([#2181](https://github.com/contentauth/c2pa-rs/pull/2181))
+
+### Fixed
+
+* Harden JUMBF and JPEG XL parsers against Brotli decompression bombs ([#2210](https://github.com/contentauth/c2pa-rs/pull/2210))
+
+## [0.88.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.87.0...c2pa-v0.88.0)
+_11 June 2026_
+
+### Added
+
+* Remove some long deprecated APIs ([#2206](https://github.com/contentauth/c2pa-rs/pull/2206))
+
+## [0.87.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.86.1...c2pa-v0.87.0)
+_11 June 2026_
+
+### Added
+
+* [**breaking**] Split c2pa-raw-crypto into its own crate ([#2202](https://github.com/contentauth/c2pa-rs/pull/2202))
+
+### Fixed
+
+* Improve ingredientMismatch error messages ([#2225](https://github.com/contentauth/c2pa-rs/pull/2225))
+* Noop test new release workflow ([#2221](https://github.com/contentauth/c2pa-rs/pull/2221))
+
+### Other
+
+* Revert "feat!: Split c2pa-raw-crypto into its own crate ([#2202](https://github.com/contentauth/c2pa-rs/pull/2202))"
+* Use latest `release-plz` and add a dry run job on release PRs ([#2217](https://github.com/contentauth/c2pa-rs/pull/2217))
+
+## [0.86.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.86.0...c2pa-v0.86.1)
+_08 June 2026_
+
+### Fixed
+
+* NOOP PR for release-plz trigger ([#2215](https://github.com/contentauth/c2pa-rs/pull/2215))
+
+## [0.86.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.85.2...c2pa-v0.86.0)
+_04 June 2026_
+
+### Fixed
+
+* [**breaking**] Remove unused `Error` variant types ([#2195](https://github.com/contentauth/c2pa-rs/pull/2195))
+* Harden additional JUMBF parser sites against integer underflow ([#2201](https://github.com/contentauth/c2pa-rs/pull/2201))
+
+## [0.85.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.85.1...c2pa-v0.85.2)
+_03 June 2026_
+
+### Fixed
+
+* Exact ingredient redaction URI matching ([#2203](https://github.com/contentauth/c2pa-rs/pull/2203))
+* Harden against integer underflow in JUMBF box parsers ([#2200](https://github.com/contentauth/c2pa-rs/pull/2200))
+* Dup redaction ([#2199](https://github.com/contentauth/c2pa-rs/pull/2199))
+* Harden against unchecked array index in JUMBF brotli box accessor ([#2192](https://github.com/contentauth/c2pa-rs/pull/2192))
+* Make GIF box map C2PA placeholder len 0 rather than 1 ([#2156](https://github.com/contentauth/c2pa-rs/pull/2156))
+* Error with validation results on invalid manifest after verify after sign ([#2147](https://github.com/contentauth/c2pa-rs/pull/2147))
+
+## [0.85.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.85.0...c2pa-v0.85.1)
+_01 June 2026_
+
+### Fixed
+
+* Preserve validation status log kind after deserialization ([#2162](https://github.com/contentauth/c2pa-rs/pull/2162))
+* Declare c2pa XML namespace on SVG root, not manifest tag ([#2113](https://github.com/contentauth/c2pa-rs/pull/2113))
+
+### Other
+
+* Avoid buffering intermediate streams if stream len is greater than threshold ([#2178](https://github.com/contentauth/c2pa-rs/pull/2178))
+* Avoid buffering PNG when writing XMP and removing manifest ([#2177](https://github.com/contentauth/c2pa-rs/pull/2177))
+
+## [0.85.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.84.1...c2pa-v0.85.0)
+_27 May 2026_
+
+### Added
+
+* Support CAWG callback signing via c_ffi ([#2118](https://github.com/contentauth/c2pa-rs/pull/2118))
+
+### Fixed
+
+* Sync resolver for CAWG web DID ([#2172](https://github.com/contentauth/c2pa-rs/pull/2172))
+* Load ingredient manifest store esp. to load resources on search/load miss ([#2164](https://github.com/contentauth/c2pa-rs/pull/2164))
+* Share reqwest HTTP clients ([#2152](https://github.com/contentauth/c2pa-rs/pull/2152))
+* Improve archive APIs to be able to link archives to actions ([#2095](https://github.com/contentauth/c2pa-rs/pull/2095))
+* Use XMP instance_id from source asset in sign and save_to_stream ([#2158](https://github.com/contentauth/c2pa-rs/pull/2158))
+* Harden against Builder::base_path injection attack on archive deserialisation ([#2139](https://github.com/contentauth/c2pa-rs/pull/2139))
+* Harden against integer overflow attacks in hash_stream_by_alg_with_progress range validation ([#2140](https://github.com/contentauth/c2pa-rs/pull/2140))
+
+### Other
+
+* Skip intermediate stream copy for common signing path ([#2161](https://github.com/contentauth/c2pa-rs/pull/2161))
+* Avoid buffering PNG into memory when writing ([#2159](https://github.com/contentauth/c2pa-rs/pull/2159))
+* Avoid buffering stream when computing placeholder PNG C2PA chunk ([#2154](https://github.com/contentauth/c2pa-rs/pull/2154))
+* Avoid buffering stream when computing placeholder JPEG C2PA chunk ([#2155](https://github.com/contentauth/c2pa-rs/pull/2155))
+* Fix lints in newer Rust versions. ([#2153](https://github.com/contentauth/c2pa-rs/pull/2153))
+* Optimize signing passes/copies for large PNGs ([#1967](https://github.com/contentauth/c2pa-rs/pull/1967))
+* Optimize signing passes/copies for large RIFFs ([#1970](https://github.com/contentauth/c2pa-rs/pull/1970))
+* Optimize signing passes/copies for large JPEGs ([#1971](https://github.com/contentauth/c2pa-rs/pull/1971))
+* Lazy-load ingredient manifest stores from shared Arc<Store>  ([#2103](https://github.com/contentauth/c2pa-rs/pull/2103))
+* Consolidate embeddable async functions ([#2149](https://github.com/contentauth/c2pa-rs/pull/2149))
+* Consolidate async verify functions ([#2146](https://github.com/contentauth/c2pa-rs/pull/2146))
+
+## [0.84.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.84.0...c2pa-v0.84.1)
+_12 May 2026_
+
+### Fixed
+
+* Case-insensitive enums in settings to preserve backwards compatibility with `config` crate ([#2138](https://github.com/contentauth/c2pa-rs/pull/2138))
+
+## [0.84.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.83.0...c2pa-v0.84.0)
+_11 May 2026_
+
+### Fixed
+
+* Archive preserves duplicate label assertions ([#2135](https://github.com/contentauth/c2pa-rs/pull/2135))
+
+### Other
+
+* [**breaking**] Remove `config` crate and use `serde_json` directly ([#2132](https://github.com/contentauth/c2pa-rs/pull/2132))
+
+## [0.83.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.82.1...c2pa-v0.83.0)
+_11 May 2026_
+
+### Added
+
+* Large and complex benchmark suite ([#2116](https://github.com/contentauth/c2pa-rs/pull/2116))
+
+### Fixed
+
+* Reduce allocations in redactions ([#2127](https://github.com/contentauth/c2pa-rs/pull/2127))
+* Allow boxes with incomplete content to succeed. ([#2125](https://github.com/contentauth/c2pa-rs/pull/2125))
+
+### Other
+
+* Update `cargo-udeps` setup ([#2047](https://github.com/contentauth/c2pa-rs/pull/2047))
+
+## [0.82.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.82.0...c2pa-v0.82.1)
+_04 May 2026_
+
+### Fixed
+
+* Harden against integer underflow attack in GIF XMP validation ([#2099](https://github.com/contentauth/c2pa-rs/pull/2099))
+* Harden error code mapping for hash mismatch in validator ([#2101](https://github.com/contentauth/c2pa-rs/pull/2101))
+* Update logic for stale thumbnails detection in redaction ([#2107](https://github.com/contentauth/c2pa-rs/pull/2107))
+
+## [0.82.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.81.0...c2pa-v0.82.0)
+_01 May 2026_
+
+### Fixed
+
+* Harden against unbounded HTTP response body read in DID web server ([#2070](https://github.com/contentauth/c2pa-rs/pull/2070))
+
+## [0.81.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.80.3...c2pa-v0.81.0)
+_01 May 2026_
+
+### Added
+
+* Make `c2pa_reason` an enum ([#2100](https://github.com/contentauth/c2pa-rs/pull/2100))
+
+### Fixed
+
+* Harden against integer underflow attacks in parsing purpose field in BMFF UUID box ([#2097](https://github.com/contentauth/c2pa-rs/pull/2097))
+* Harden against integer overflow attack in png chunk hashing for 32 bit WASM architecture ([#2102](https://github.com/contentauth/c2pa-rs/pull/2102))
+* [**breaking**] Use absolute URIs for ingredient thumbnails ([#2098](https://github.com/contentauth/c2pa-rs/pull/2098))
+
+## [0.80.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.80.2...c2pa-v0.80.3)
+_29 April 2026_
+
+### Added
+
+* Support DNG big data ([#2092](https://github.com/contentauth/c2pa-rs/pull/2092))
+* Add `init trust`, trust sidecars, and atomic sidecar writes, plus fixes ([#2093](https://github.com/contentauth/c2pa-rs/pull/2093))
+
+### Updated dependencies
+
+* Bump openssl from 0.10.77 to 0.10.78 ([#2082](https://github.com/contentauth/c2pa-rs/pull/2082))
+
+## [0.80.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.80.1...c2pa-v0.80.2)
+_28 April 2026_
+
+### Documented
+
+* Adds redaction docs and example ([#2071](https://github.com/contentauth/c2pa-rs/pull/2071))
+
+### Fixed
+
+* `c2pa-c-ffi` UB detected by miri ([#2089](https://github.com/contentauth/c2pa-rs/pull/2089))
+* Harden RSA validators against invalid BER sequences ([#2065](https://github.com/contentauth/c2pa-rs/pull/2065))
+* Harden against deep linear ingredient chains with max limits ([#2064](https://github.com/contentauth/c2pa-rs/pull/2064))
+* Harden BMFF hash merkel tree creation with max merkel leaves limits ([#2063](https://github.com/contentauth/c2pa-rs/pull/2063))
+* Harden against image decompression bomb attacks in building thumbnail ([#2062](https://github.com/contentauth/c2pa-rs/pull/2062))
+* Harden tiff parser against forged IFD entry count fields ([#2059](https://github.com/contentauth/c2pa-rs/pull/2059))
+* Harden builder and resource store addition against path traversal zip slip attacks ([#2066](https://github.com/contentauth/c2pa-rs/pull/2066))
+
+## [0.80.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.80.0...c2pa-v0.80.1)
+_27 April 2026_
+
+### Fixed
+
+* Harden against empty certificates during OCSP certificate validation ([#2067](https://github.com/contentauth/c2pa-rs/pull/2067))
+* Prevent duplicate timestamp assertion ([#2085](https://github.com/contentauth/c2pa-rs/pull/2085))
+* Harden riff chunk parser against forged size field memory attacks ([#2053](https://github.com/contentauth/c2pa-rs/pull/2053))
+* Harden bmff parsing against integer overflow attack ([#2054](https://github.com/contentauth/c2pa-rs/pull/2054))
+* Harden against cyclic IFD chain in tiff parser ([#2068](https://github.com/contentauth/c2pa-rs/pull/2068))
+
+## [0.80.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.5...c2pa-v0.80.0)
+_16 April 2026_
+
+### Added
+
+* Add ingredient archive FFI functions and relax Builder mutability ([#2061](https://github.com/contentauth/c2pa-rs/pull/2061))
+* Compressed manifest ([#2027](https://github.com/contentauth/c2pa-rs/pull/2027))
+
+### Documented
+
+* Separate out C docs ([#2052](https://github.com/contentauth/c2pa-rs/pull/2052))
+
+### Fixed
+
+* Multi rendition support ([#2058](https://github.com/contentauth/c2pa-rs/pull/2058))
+
+## [0.79.5](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.4...c2pa-v0.79.5)
+_15 April 2026_
+
+### Fixed
+
+* Handle more thumbnail redaction edge cases ([#2049](https://github.com/contentauth/c2pa-rs/pull/2049))
+
+## [0.79.4](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.3...c2pa-v0.79.4)
+_14 April 2026_
+
+### Fixed
+
+* Run cargo fmt ([#2046](https://github.com/contentauth/c2pa-rs/pull/2046))
+* Wrap Error::NotImplemented in Err() for wasip1 tempfile_builder ([#2037](https://github.com/contentauth/c2pa-rs/pull/2037))
+* Limit the maximum number of assertions allowed for C2PA Manifest ([#1951](https://github.com/contentauth/c2pa-rs/pull/1951))
+
+## [0.79.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.2...c2pa-v0.79.3)
+_09 April 2026_
+
+### Added
+
+* *(sdk)* Ingredient JUMBF archives, archive metadata typing ([#2007](https://github.com/contentauth/c2pa-rs/pull/2007))
+
+### Fixed
+
+* Redaction follow-up fix ([#2030](https://github.com/contentauth/c2pa-rs/pull/2030))
+
+## [0.79.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.1...c2pa-v0.79.2)
+_08 April 2026_
+
+### Fixed
+
+* Harden against integer overflow panic in big tiff processing ([#2012](https://github.com/contentauth/c2pa-rs/pull/2012))
+* Harden against integer underflow panic in assertion label parsing ([#2013](https://github.com/contentauth/c2pa-rs/pull/2013))
+* Harden assertion label URI parsing logic to fix index out of bounds access ([#2018](https://github.com/contentauth/c2pa-rs/pull/2018))
+* Harden BMFF hash merkle validation via count/range mismatch ([#2019](https://github.com/contentauth/c2pa-rs/pull/2019))
+* Harden BmffHash timed media chunk verification against out of bounds access issue ([#2020](https://github.com/contentauth/c2pa-rs/pull/2020))
+* Harden BMFF Merkle maps processing logic to avoid panic ([#2021](https://github.com/contentauth/c2pa-rs/pull/2021))
+* Harden against invalid MP4 files during BmffHash timed-media chunk mapping ([#2022](https://github.com/contentauth/c2pa-rs/pull/2022))
+* Redact thumbnails when ingredient with thumbnails added through add_ingredient is being thumbnail-redacted too ([#2016](https://github.com/contentauth/c2pa-rs/pull/2016))
+* Allow any file type to be signed with a sidecar ([#2014](https://github.com/contentauth/c2pa-rs/pull/2014))
+
+## [0.79.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.79.0...c2pa-v0.79.1)
+_07 April 2026_
+
+### Fixed
+
+* Redact thumbnails in databoxes (v1 claims) ([#2015](https://github.com/contentauth/c2pa-rs/pull/2015))
+
+## [0.79.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.8...c2pa-v0.79.0)
+_03 April 2026_
+
+### Fixed
+
+* Redacting things in multiple ingredients ([#2009](https://github.com/contentauth/c2pa-rs/pull/2009))
+* Adds more granular progress for validation ([#2006](https://github.com/contentauth/c2pa-rs/pull/2006))
+* [**breaking**] Disable HTTP redirects in restricted networking implementation ([#1907](https://github.com/contentauth/c2pa-rs/pull/1907))
+
+## [0.78.8](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.7...c2pa-v0.78.8)
+_31 March 2026_
+
+### Added
+
+* Expose a C FFI API to help determine the hashtype a Builder uses with embeddable APIs ([#1992](https://github.com/contentauth/c2pa-rs/pull/1992))
+* Add support for JPEG XL file format ([#1870](https://github.com/contentauth/c2pa-rs/pull/1870))
+
+### Fixed
+
+* Switch to Firefox for CI web tests ([#1999](https://github.com/contentauth/c2pa-rs/pull/1999))
+
+### Other
+
+* Fix clippy lints ([#1996](https://github.com/contentauth/c2pa-rs/pull/1996))
+
+## [0.78.7](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.6...c2pa-v0.78.7)
+_27 March 2026_
+
+### Added
+
+* Adds a progress/cancel feature to Context for the c2pa-rs sdk ([#1927](https://github.com/contentauth/c2pa-rs/pull/1927))
+
+### Fixed
+
+* Harden JUMB embed media description box parser against integer underflow attack ([#1950](https://github.com/contentauth/c2pa-rs/pull/1950))
+* Harden JUMB description box parser against integer underflow attack ([#1949](https://github.com/contentauth/c2pa-rs/pull/1949))
+* Harden JUMBF nested box parsing against stack overflow attack ([#1966](https://github.com/contentauth/c2pa-rs/pull/1966))
+* Harden BMFF Merkle tree hash processing code against integer underflow attack ([#1963](https://github.com/contentauth/c2pa-rs/pull/1963))
+* Updated crJSON Schema ([#1975](https://github.com/contentauth/c2pa-rs/pull/1975))
+* TIFF backcompatibility for RAW formats ([#1976](https://github.com/contentauth/c2pa-rs/pull/1976))
+* Check for malicious recursion ([#1979](https://github.com/contentauth/c2pa-rs/pull/1979))
+
+## [0.78.6](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.5...c2pa-v0.78.6)
+_23 March 2026_
+
+### Added
+
+* Add FLAC format support ([#1912](https://github.com/contentauth/c2pa-rs/pull/1912))
+
+## [0.78.5](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.4...c2pa-v0.78.5)
+_23 March 2026_
+
+### Added
+
+* Add `cr_json()` and `cr_json_value()` to `Reader`; remove separate `CrJsonReader` ([#1919](https://github.com/contentauth/c2pa-rs/pull/1919))
+
+### Fixed
+
+* Add compatibility for source assets that report mdat box sizes that e… ([#1956](https://github.com/contentauth/c2pa-rs/pull/1956))
+* Change `Builder::add_action` to add original actions or v2 actions ([#1946](https://github.com/contentauth/c2pa-rs/pull/1946))
+
+## [0.78.4](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.3...c2pa-v0.78.4)
+_16 March 2026_
+
+### Fixed
+
+* Pin `atree` to 0.5.2 ([#1940](https://github.com/contentauth/c2pa-rs/pull/1940))
+* Remove exponential memory growth from nested claim reconstruction ([#1885](https://github.com/contentauth/c2pa-rs/pull/1885)) ([#1887](https://github.com/contentauth/c2pa-rs/pull/1887))
+
+## [0.78.3](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.2...c2pa-v0.78.3)
+_13 March 2026_
+
+### Added
+
+* Impl `Send + Sync` on `EphemeralSigner` ([#1934](https://github.com/contentauth/c2pa-rs/pull/1934))
+
+### Fixed
+
+* Apply same restrictions on ingredient deltas as active manifest for validation state ([#1624](https://github.com/contentauth/c2pa-rs/pull/1624))
+
+## [0.78.2](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.1...c2pa-v0.78.2)
+_12 March 2026_
+
+### Fixed
+
+* Windows Build flags ([#1930](https://github.com/contentauth/c2pa-rs/pull/1930))
+
+## [0.78.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.78.0...c2pa-v0.78.1)
+_12 March 2026_
+
+### Fixed
+
+* Fragmented video verification ([#1925](https://github.com/contentauth/c2pa-rs/pull/1925))
+
+## [0.78.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.77.1...c2pa-v0.78.0)
+_11 March 2026_
+
+### Added
+
+* Emscripten ([#1886](https://github.com/contentauth/c2pa-rs/pull/1886))
+
+### Fixed
+
+* Correct validation of OCSP signature ([#1863](https://github.com/contentauth/c2pa-rs/pull/1863))
+* Merkle api integration ([#1902](https://github.com/contentauth/c2pa-rs/pull/1902))
+
+## [0.77.1](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.77.0...c2pa-v0.77.1)
+_10 March 2026_
+
+### Documented
+
+* Combine docs on Context and Settings to reduce duplication ([#1899](https://github.com/contentauth/c2pa-rs/pull/1899))
+
 ## [0.77.0](https://github.com/contentauth/c2pa-rs/compare/c2pa-v0.76.2...c2pa-v0.77.0)
 _04 March 2026_
 

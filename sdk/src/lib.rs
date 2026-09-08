@@ -246,11 +246,11 @@ pub use assertions::DigitalSourceType;
 #[doc(inline)]
 pub use assertions::Relationship;
 pub use assertions::{compute_bmff_flat_hash, compute_bmff_mdat_merkle_roots};
-pub use builder::{Builder, BuilderIntent, ManifestDefinition};
+pub use builder::{Builder, BuilderIntent, HashType, ManifestDefinition};
 pub use callback_signer::{CallbackFunc, CallbackSigner};
 pub use claim_generator_info::ClaimGeneratorInfo;
 #[doc(inline)]
-pub use context::Context;
+pub use context::{Context, ProgressCallbackFunc, ProgressPhase};
 pub use crypto::raw_signature::SigningAlg;
 pub use error::{Error, Result};
 #[doc(hidden)]
@@ -258,9 +258,6 @@ pub use external_manifest::ManifestPatchCallback;
 pub use hash_utils::{hash_stream_by_alg, HashRange};
 pub use hashed_uri::HashedUri;
 pub use ingredient::Ingredient;
-#[cfg(feature = "file_io")]
-#[doc(hidden)]
-pub use ingredient::{DefaultOptions, IngredientOptions};
 pub use manifest::{Manifest, SignatureInfo};
 pub use manifest_assertion::{ManifestAssertion, ManifestAssertionKind};
 pub use merkle_utils::{compute_merkle_proof, compute_merkle_root};
@@ -285,6 +282,7 @@ pub(crate) mod claim;
 pub(crate) mod claim_generator_info;
 pub(crate) mod context;
 pub(crate) mod cose_validator;
+pub(crate) mod crjson;
 pub(crate) mod error;
 pub(crate) mod external_manifest;
 pub(crate) mod hashed_uri;

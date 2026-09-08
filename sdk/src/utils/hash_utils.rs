@@ -14,6 +14,7 @@
 use std::{
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
+    num::NonZeroUsize,
     ops::RangeInclusive,
     path::Path,
 };
@@ -86,11 +87,17 @@ pub fn vec_compare(va: &[u8], vb: &[u8]) -> bool {
        .all(|(a,b)| a == b)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Hasher {
     SHA256(Sha256),
     SHA384(Sha384),
     SHA512(Sha512),
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Hasher::SHA256(Sha256::new())
+    }
 }
 
 impl Hasher {
@@ -209,16 +216,48 @@ pub fn hash_asset_by_alg_with_inclusions(
 
     The data is again split into range sets breaking at the exclusion points and now also the markers.
 */
-/// May be used to generate hashes in combination with embeddable APIs.
-pub fn hash_stream_by_alg<R>(
+/// Internal implementation of [`hash_stream_by_alg`] with an optional per-range
+/// progress/cancellation callback.  SDK internals that have a [`Context`] available
+/// pass a closure that calls [`Context::check_progress`]; the public wrapper supplies
+/// `None` so external callers are unaffected.
+pub(crate) fn hash_stream_by_alg_with_progress<R, F>(
     alg: &str,
     data: &mut R,
     hash_range: Option<Vec<HashRange>>,
     is_exclusion: bool,
+    progress: &mut F,
 ) -> Result<Vec<u8>>
 where
     R: Read + Seek + ?Sized,
+    F: FnMut(u32, u32) -> Result<()>,
 {
+    let max_hash_buf = NonZeroUsize::new(MAX_HASH_BUF)
+        .ok_or(Error::BadParam("invalid max_hash_buf".to_string()))?;
+    hash_stream_by_alg_with_progress_impl(
+        alg,
+        data,
+        hash_range,
+        is_exclusion,
+        progress,
+        max_hash_buf,
+    )
+}
+
+/// Make `hash_stream_by_alg_with_progress` configurable with `max_hash_buf`.
+/// e.g. makes it configurable in tests too.
+fn hash_stream_by_alg_with_progress_impl<R, F>(
+    alg: &str,
+    data: &mut R,
+    hash_range: Option<Vec<HashRange>>,
+    is_exclusion: bool,
+    progress: &mut F,
+    max_hash_buf: NonZeroUsize,
+) -> Result<Vec<u8>>
+where
+    R: Read + Seek + ?Sized,
+    F: FnMut(u32, u32) -> Result<()>,
+{
+    let max_hash_buf = max_hash_buf.get();
     let mut bmff_v2_starts: Vec<u64> = Vec::new();
 
     use Hasher::*;
@@ -246,7 +285,10 @@ where
 
             // verify structure of blocks
             let num_blocks = hr.len();
-            let range_end = hr[num_blocks - 1].start() + hr[num_blocks - 1].length();
+            let range_end = hr[num_blocks - 1]
+                .start()
+                .checked_add(hr[num_blocks - 1].length())
+                .ok_or(Error::BadParam("hash range overflow".to_string()))?;
             let data_end = data_len - 1;
 
             // range extends past end of file so fail
@@ -344,7 +386,11 @@ where
                         continue;
                     }
 
-                    let end = inclusion.start() + inclusion.length() - 1;
+                    let end = inclusion
+                        .start()
+                        .checked_add(inclusion.length())
+                        .ok_or(Error::BadParam("inclusion range overflow".to_string()))?
+                        - 1;
                     let inclusion_start = inclusion.start();
 
                     // add new BMFF V2 offset as a new range to be included so that we can
@@ -369,9 +415,23 @@ where
         }
     };
 
+    // Total callbacks = one per 256 MB chunk across all ranges (BMFF V2 single-byte offsets
+    // each contribute exactly one tick regardless of MAX_HASH_BUF).
+    let total: u32 = ranges
+        .iter()
+        .map(|r| {
+            let len = r.end() - r.start() + 1;
+            (len as usize).div_ceil(max_hash_buf) as u32
+        })
+        .sum();
+    let mut step: u32 = 0;
+
     if cfg!(target_arch = "wasm32") {
         // hash the data for ranges
         for r in ranges {
+            step += 1;
+            progress(step, total)?;
+
             let start = r.start();
             let end = r.end();
             let mut chunk_left = end - start + 1;
@@ -386,7 +446,7 @@ where
             data.seek(SeekFrom::Start(*start))?;
 
             loop {
-                let mut chunk = vec![0u8; std::cmp::min(chunk_left as usize, MAX_HASH_BUF)];
+                let mut chunk = vec![0u8; std::cmp::min(chunk_left as usize, max_hash_buf)];
 
                 data.read_exact(&mut chunk)?;
 
@@ -396,11 +456,19 @@ where
                 if chunk_left == 0 {
                     break;
                 }
+
+                // fire after each non-final chunk so large ranges report sub-range progress
+                step += 1;
+                progress(step, total)?;
             }
         }
     } else {
-        // hash the data for ranges
+        // hash the data for ranges, reading the next chunk on this thread while
+        // the current one hashes on a worker (hash is still moving ahead sequentially).
         for r in ranges {
+            step += 1;
+            progress(step, total)?;
+
             let start = r.start();
             let end = r.end();
             let mut chunk_left = end - start + 1;
@@ -414,36 +482,39 @@ where
             // move to start of range
             data.seek(SeekFrom::Start(*start))?;
 
-            let mut chunk = vec![0u8; std::cmp::min(chunk_left as usize, MAX_HASH_BUF)];
+            let mut chunk = vec![0u8; std::cmp::min(chunk_left as usize, max_hash_buf)];
             data.read_exact(&mut chunk)?;
 
             loop {
-                let (tx, rx) = std::sync::mpsc::channel();
-
                 chunk_left -= chunk.len() as u64;
 
-                std::thread::spawn(move || {
-                    hasher_enum.update(&chunk);
-                    tx.send(hasher_enum).unwrap_or_default();
-                });
-
-                // are we done
+                // with no next chunk to read there is nothing to overlap, so hash inline.
                 if chunk_left == 0 {
-                    hasher_enum = match rx.recv() {
-                        Ok(hasher) => hasher,
-                        Err(_) => return Err(Error::ThreadReceiveError),
-                    };
+                    hasher_enum.update(&chunk);
                     break;
                 }
 
+                let (tx, rx) = std::sync::mpsc::channel();
+
+                std::thread::Builder::new()
+                    .name("c2pa-hash".to_string())
+                    .spawn(move || {
+                        hasher_enum.update(&chunk);
+                        tx.send(hasher_enum).unwrap_or_default();
+                    })?;
+
                 // read next chunk while we wait for hash
-                let mut next_chunk = vec![0u8; std::cmp::min(chunk_left as usize, MAX_HASH_BUF)];
+                let mut next_chunk = vec![0u8; std::cmp::min(chunk_left as usize, max_hash_buf)];
                 data.read_exact(&mut next_chunk)?;
 
                 hasher_enum = match rx.recv() {
                     Ok(hasher) => hasher,
                     Err(_) => return Err(Error::ThreadReceiveError),
                 };
+
+                // fire after each completed pipeline stage so large ranges report sub-range progress
+                step += 1;
+                progress(step, total)?;
 
                 chunk = next_chunk;
             }
@@ -452,6 +523,19 @@ where
 
     // return the hash
     Ok(Hasher::finalize(hasher_enum))
+}
+
+/// May be used to generate hashes in combination with embeddable APIs.
+pub fn hash_stream_by_alg<R>(
+    alg: &str,
+    data: &mut R,
+    hash_range: Option<Vec<HashRange>>,
+    is_exclusion: bool,
+) -> Result<Vec<u8>>
+where
+    R: Read + Seek + ?Sized,
+{
+    hash_stream_by_alg_with_progress(alg, data, hash_range, is_exclusion, &mut |_, _| Ok(()))
 }
 
 // verify the hash using the specified algorithm
@@ -545,4 +629,146 @@ pub fn hash_to_b64(mut value: Value) -> Value {
         }
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::io::Cursor;
+
+    use hex_literal::hex;
+
+    use super::*;
+
+    // Small enough that a few KB of test data spans multiple chunks.
+    fn test_hash_buf() -> NonZeroUsize {
+        NonZeroUsize::new(1024).unwrap()
+    }
+
+    // Attacker-controlled HashRange with start+length > u64::MAX must return Err,
+    // not panic, in both the exclusion and inclusion paths.
+    #[test]
+    fn test_exclusion_range_overflow_returns_error() {
+        let data = vec![0u8; 64];
+        let mut reader = Cursor::new(&data);
+        let hr = vec![HashRange::new(u64::MAX - 10, 20)]; // start + length overflows u64
+        let result = hash_stream_by_alg("sha256", &mut reader, Some(hr), true);
+        assert!(
+            result.is_err(),
+            "exclusion range overflow must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn test_inclusion_range_overflow_returns_error() {
+        let data = vec![0u8; 64];
+        let mut reader = Cursor::new(&data);
+        let hr = vec![HashRange::new(u64::MAX, 1)]; // start + length overflows u64
+        let result = hash_stream_by_alg("sha256", &mut reader, Some(hr), false);
+        assert!(
+            result.is_err(),
+            "inclusion range overflow must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn progress_callback_is_called() {
+        let data = vec![0u8; 64];
+        let mut called = false;
+        let mut reader = Cursor::new(&data);
+        let mut cb = |_step, _total| {
+            called = true;
+            Ok(())
+        };
+        hash_stream_by_alg_with_progress("sha256", &mut reader, None, true, &mut cb).unwrap();
+        assert!(called, "progress callback should have been invoked");
+    }
+
+    #[test]
+    fn progress_callback_can_cancel() {
+        let data = vec![0u8; 64];
+        let mut reader = Cursor::new(&data);
+        let mut cb = |_step, _total| Err(Error::OperationCancelled);
+        let result = hash_stream_by_alg_with_progress("sha256", &mut reader, None, true, &mut cb);
+        assert!(
+            matches!(result, Err(Error::OperationCancelled)),
+            "expected OperationCancelled, got {result:?}"
+        );
+    }
+
+    // One tick per range before any read, one after each non-final chunk,
+    // none for the final chunk regardless of whether it hashed inline.
+    #[test]
+    fn progress_sequence_multi_chunk() {
+        let data = vec![0u8; 3 * 1024]; // 3 chunks at the 1024 buffer size below
+        let mut reader = Cursor::new(&data);
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        let mut cb = |step, total| {
+            seen.push((step, total));
+            Ok(())
+        };
+        hash_stream_by_alg_with_progress_impl(
+            "sha256",
+            &mut reader,
+            None,
+            true,
+            &mut cb,
+            test_hash_buf(),
+        )
+        .unwrap();
+        assert_eq!(seen, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    // 3 chunks at the 1024 buffer size passed below, non-uniform.
+    // A reordered or dropped chunk changes the hash.
+    // Expected value computed with:
+    //   python3 -c "import hashlib
+    //   d = bytes((i % 251) for i in range(3*1024))
+    //   print(hashlib.sha256(d).hexdigest())"
+    #[test]
+    fn multi_chunk_digest_matches_known_value() {
+        let data: Vec<u8> = (0..3 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut reader = Cursor::new(&data);
+        let hash = hash_stream_by_alg_with_progress_impl(
+            "sha256",
+            &mut reader,
+            None,
+            true,
+            &mut |_, _| Ok(()),
+            test_hash_buf(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            hash,
+            hex!("5f24b2f16026ec7d0450a5a08283d3cfd47302fe859f579ed79fe7d2663b73f9")
+        );
+    }
+
+    // Exclusion splits this into a 1-chunk range and a 2-chunk range.
+    // Expected value computed with:
+    //   python3 -c "import hashlib
+    //   d = bytes((i % 251) for i in range(3*1024))
+    //   print(hashlib.sha256(d[:1000] + d[1100:]).hexdigest())"
+    #[test]
+    fn multi_chunk_digest_survives_range_splits() {
+        let data: Vec<u8> = (0..3 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut reader = Cursor::new(&data);
+        let hr = vec![HashRange::new(1000, 100)];
+        let hash = hash_stream_by_alg_with_progress_impl(
+            "sha256",
+            &mut reader,
+            Some(hr),
+            true,
+            &mut |_, _| Ok(()),
+            test_hash_buf(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            hash,
+            hex!("e3301ce38a42503098530b98cd1b652a10c5caf890735017dd0012ec319f04e5")
+        );
+    }
 }

@@ -41,7 +41,7 @@ use crate::{
     },
     asset_io::CAIRead,
     cbor_types::map_cbor_to_type,
-    context::Context,
+    context::{Context, ProgressPhase},
     cose_validator::{
         get_signing_cert_serial_num, get_signing_info, get_signing_info_async, verify_cose,
         verify_cose_async,
@@ -66,15 +66,15 @@ use crate::{
         labels::{
             assertion_label_from_uri, box_name_from_uri, manifest_label_from_uri,
             manifest_label_to_parts, to_absolute_uri, to_assertion_uri, to_databox_uri,
-            to_manifest_uri, to_signature_uri, ASSERTIONS, CLAIM, CREDENTIALS, DATABOX, DATABOXES,
-            SIGNATURE,
+            to_manifest_uri, to_normalized_uri, to_signature_uri, ASSERTIONS, CLAIM, CREDENTIALS,
+            DATABOX, DATABOXES, SIGNATURE,
         },
     },
     jumbf_io::get_assetio_handler,
     log_item,
     resource_store::UriOrResource,
     salt::{DefaultSalt, SaltGenerator},
-    settings::Settings,
+    settings::{Settings, MAX_ASSERTIONS},
     status_tracker::{ErrorBehavior, StatusTracker},
     store::StoreValidationInfo,
     utils::hash_utils::{hash_by_alg, vec_compare},
@@ -268,6 +268,14 @@ pub struct Claim {
     // root of CAI store
     update_manifest: bool,
 
+    // true if this claim was read from a `c2md`-tagged superbox (C2PA spec
+    // 11.2.2) rather than an ordinary `c2ma` standard manifest. Preserved so
+    // the original tag survives round-trips (e.g. ingredient copies).
+    is_c2md: bool,
+
+    // true if manifest is or will be stored compressed
+    compressed: bool,
+
     pub title: Option<String>, // title for this claim, generally the name of the containing asset
 
     pub format: Option<String>, // mime format of document containing this claim
@@ -449,6 +457,8 @@ impl Claim {
             instance_id: "".to_string(),
 
             update_manifest: false,
+            is_c2md: false,
+            compressed: false,
             data_boxes: Vec::new(),
             metadata: None,
             claim_version,
@@ -548,6 +558,8 @@ impl Claim {
             instance_id: "".to_string(),
 
             update_manifest: false,
+            is_c2md: false,
+            compressed: false,
             data_boxes: Vec::new(),
             metadata: None,
             claim_version,
@@ -660,6 +672,8 @@ impl Claim {
             Ok(Claim {
                 remote_manifest: RemoteManifest::NoRemote,
                 update_manifest: false,
+                is_c2md: false,
+                compressed: false,
                 title,
                 format: Some(format),
                 instance_id,
@@ -768,6 +782,8 @@ impl Claim {
             Ok(Claim {
                 remote_manifest: RemoteManifest::NoRemote,
                 update_manifest: false,
+                is_c2md: false,
+                compressed: false,
                 title,
                 format: None,
                 instance_id,
@@ -1143,9 +1159,24 @@ impl Claim {
         self.update_manifest
     }
 
+    /// True if this claim was read from a `c2md`-tagged superbox (C2PA spec
+    /// 11.2.2) rather than an ordinary `c2ma` standard manifest.
+    pub fn is_c2md(&self) -> bool {
+        self.is_c2md
+    }
+
     // get version of the Claim
     pub fn version(&self) -> usize {
         self.claim_version
+    }
+
+    // manifests compression enabled
+    pub fn compressed(&self) -> bool {
+        self.compressed
+    }
+
+    pub(crate) fn set_compressed_manifest(&mut self, compressed: bool) {
+        self.compressed = compressed;
     }
 
     pub fn set_remote_manifest<S: Into<String> + AsRef<str>>(
@@ -1180,6 +1211,10 @@ impl Claim {
 
     pub(crate) fn set_update_manifest(&mut self, is_update_manifest: bool) {
         self.update_manifest = is_update_manifest;
+    }
+
+    pub(crate) fn set_is_c2md(&mut self, is_c2md: bool) {
+        self.is_c2md = is_c2md;
     }
 
     /// Adds an action to the claim.
@@ -1427,6 +1462,14 @@ impl Claim {
         salt_generator: &impl SaltGenerator,
         add_as_created_assertion: bool,
     ) -> Result<C2PAAssertion> {
+        // Enforce the per-manifest assertion limit to prevent resource exhaustion
+        // regardless of how the claim is constructed.
+        if self.assertion_store.len() >= MAX_ASSERTIONS {
+            return Err(Error::TooManyAssertions {
+                max: MAX_ASSERTIONS,
+            });
+        }
+
         // make sure the assertion is valid
         let assertion = assertion_builder.to_assertion()?;
         let assertion_label = assertion.label();
@@ -1561,11 +1604,8 @@ impl Claim {
             hr.url()
         } else {
             // make a full path
-            if let Some(box_name) = box_name_from_uri(&hr.url()) {
-                to_databox_uri(self.label(), &box_name)
-            } else {
-                return None;
-            }
+            let box_name = box_name_from_uri(&hr.url())?;
+            to_databox_uri(self.label(), &box_name)
         };
 
         self.data_boxes.iter().find_map(|x| {
@@ -1785,38 +1825,55 @@ impl Claim {
         )
     }
 
-    /// Redact an assertion from a prior claim.
-    /// This will remove the assertion from the JUMBF
+    /// Redact an assertion from a given claim.
+    /// This will remove the assertion from the JUMBF.
     fn redact_assertion(&mut self, assertion_uri: &str) -> Result<()> {
         // cannot redact action assertions per the spec
         // cannot redact hash bindings
-        let (label, _instance) = Claim::assertion_label_from_link(assertion_uri);
+        let (label, instance) = Claim::assertion_label_from_link(assertion_uri);
         if label.starts_with(assertions::labels::ACTIONS) || label.starts_with("c2pa.hash.") {
             return Err(Error::AssertionInvalidRedaction);
         }
 
-        // delete assertion or databox
+        // A redaction URI may only target this claim.
+        if let Some(manifest) = manifest_label_from_uri(assertion_uri) {
+            if manifest != self.label() {
+                return Err(Error::AssertionRedactionNotFound);
+            }
+        }
+
+        // Delete assertion or databox
         if assertion_uri.contains(ASSERTION_STORE) {
+            // Compare the assertion label strictly using label and instance,
+            // with both sides normalized so they are comparable.
+            // `assertion_label_from_link` truncates the URI's label at `__`.
+            // Currently, the stored side is always normalized on ingest, and signing rejects
+            // a non-numeric `__` suffix, so a manifest we read here can not hold such a label.
+            let target = Claim::label_with_instance(&label, instance);
             if let Some(index) = self
                 .assertion_store
                 .iter()
-                .position(|x| assertion_uri.contains(&x.label()))
+                .position(|x| Claim::label_with_instance(&x.label_raw(), x.instance()) == target)
             {
                 self.assertion_store.remove(index);
                 return Ok(());
             }
         } else if assertion_uri.contains(DATABOX_STORE) {
+            // Normalize to a (full) databox URI.
+            let box_name =
+                box_name_from_uri(assertion_uri).ok_or(Error::AssertionRedactionNotFound)?;
+            let target = to_normalized_uri(&to_databox_uri(self.label(), &box_name));
             if let Some(index) = self
                 .databoxes()
                 .iter()
-                .position(|(x, _d)| assertion_uri.contains(&x.url()))
+                .position(|(x, _d)| to_normalized_uri(&x.url()) == target)
             {
                 self.data_boxes.remove(index);
                 return Ok(());
             }
         }
 
-        Err(Error::AssertionInvalidRedaction)
+        Err(Error::AssertionRedactionNotFound)
     }
 
     /// Return a hash of this claim.
@@ -1845,94 +1902,9 @@ impl Claim {
     /// Verify claim signature, assertion store and asset hashes
     /// claim - claim to be verified
     /// asset_bytes - reference to bytes of the asset
-    pub(crate) async fn verify_claim_async(
-        claim: &Claim,
-        asset_data: &mut ClaimAssetData<'_>,
-        svi: &StoreValidationInfo<'_>,
-        cert_check: bool,
-        ctp: &CertificateTrustPolicy,
-        validation_log: &mut StatusTracker,
-        context: &Context,
-    ) -> Result<()> {
-        let settings = context.settings();
-        // Parse COSE signed data (signature) and validate it.
-        let sig = claim.signature_val().clone();
-        let additional_bytes: Vec<u8> = Vec::new();
-        let data = claim.data()?;
-
-        // use the signature uri as the current uri while validating the signature info
-        validation_log.push_current_uri(to_signature_uri(claim.label()));
-
-        // make sure signature manifest if present points to this manifest
-        let sig_box_err = match jumbf::labels::manifest_label_from_uri(&claim.signature) {
-            Some(signature_url) if signature_url != claim.label() => true,
-            _ => {
-                jumbf::labels::box_name_from_uri(&claim.signature).unwrap_or_default()
-                    != jumbf::labels::SIGNATURE
-            } // relative signature box
-        };
-
-        if sig_box_err {
-            log_item!(
-                to_signature_uri(claim.label()),
-                "signature missing",
-                "verify_claim_async"
-            )
-            .validation_status(validation_status::CLAIM_SIGNATURE_MISSING)
-            .failure(validation_log, Error::ClaimMissingSignatureBox)?;
-        }
-
-        // for V2 and greater claims the label must conform
-        if claim.version() > 1 && manifest_label_to_parts(claim.label()).is_none() {
-            log_item!(
-                to_manifest_uri(claim.label()),
-                "claim box label invalid",
-                "verify_claim_async"
-            )
-            .validation_status(validation_status::CLAIM_MALFORMED)
-            .failure(validation_log, Error::ClaimInvalidContent)?;
-        }
-
-        let sign1 = parse_cose_sign1(&sig, &data, validation_log)?;
-        let certificate_serial_num = get_signing_cert_serial_num(&sign1)?.to_string();
-
-        // check certificate revocation
-        check_ocsp_status_async(
-            &sign1,
-            &data,
-            ctp,
-            svi.certificate_statuses.get(&certificate_serial_num),
-            svi.timestamps.get(claim.label()),
-            validation_log,
-            context,
-        )
-        .await?;
-
-        let verified = verify_cose_async(
-            &sig,
-            &data,
-            &additional_bytes,
-            cert_check,
-            ctp,
-            svi.timestamps.get(claim.label()),
-            validation_log,
-            settings,
-        )
-        .await;
-
-        let result =
-            Claim::verify_internal(claim, asset_data, svi, verified, validation_log, settings);
-        validation_log.pop_current_uri();
-        result
-    }
-
-    /// Verify claim signature, assertion store and asset hashes
-    /// claim - claim to be verified
-    /// asset_bytes - reference to bytes of the asset
-    #[allow(clippy::too_many_arguments)]
+    #[async_generic]
     pub(crate) fn verify_claim(
         claim: &Claim,
-        asset_data: &mut ClaimAssetData<'_>,
         svi: &StoreValidationInfo<'_>,
         cert_check: bool,
         ctp: &CertificateTrustPolicy,
@@ -1997,35 +1969,56 @@ impl Claim {
 
         let certificate_serial_num = get_signing_cert_serial_num(&sign1)?.to_string();
         // check certificate revocation
-        check_ocsp_status(
-            &sign1,
-            data,
-            ctp,
-            svi.certificate_statuses.get(&certificate_serial_num),
-            svi.timestamps.get(claim.label()),
-            validation_log,
-            context,
-        )?;
+        if _sync {
+            check_ocsp_status(
+                &sign1,
+                data,
+                ctp,
+                svi.certificate_statuses.get(&certificate_serial_num),
+                svi.timestamps.get(claim.label()),
+                validation_log,
+                context,
+            )?;
+        } else {
+            check_ocsp_status_async(
+                &sign1,
+                data,
+                ctp,
+                svi.certificate_statuses.get(&certificate_serial_num),
+                svi.timestamps.get(claim.label()),
+                validation_log,
+                context,
+            )
+            .await?;
+        }
 
-        let verified = verify_cose(
-            sig,
-            data,
-            &additional_bytes,
-            cert_check,
-            ctp,
-            svi.timestamps.get(claim.label()),
-            validation_log,
-            &adjusted_settings,
-        );
+        context.check_progress(ProgressPhase::VerifyingSignature, 1, 1)?;
+        let verified = if _sync {
+            verify_cose(
+                sig,
+                data,
+                &additional_bytes,
+                cert_check,
+                ctp,
+                svi.timestamps.get(claim.label()),
+                validation_log,
+                &adjusted_settings,
+            )
+        } else {
+            verify_cose_async(
+                sig,
+                data,
+                &additional_bytes,
+                cert_check,
+                ctp,
+                svi.timestamps.get(claim.label()),
+                validation_log,
+                &adjusted_settings,
+            )
+            .await
+        };
 
-        let result = Claim::verify_internal(
-            claim,
-            asset_data,
-            svi,
-            verified,
-            validation_log,
-            &adjusted_settings,
-        );
+        let result = Claim::verify_internal(claim, svi, verified, validation_log, context);
         validation_log.pop_current_uri();
         result
     }
@@ -2045,6 +2038,60 @@ impl Claim {
         );
 
         Ok(vi.cert_chain)
+    }
+
+    // Build a diagnostic message for ingredientMismatch errors, showing the failing
+    // action's index, type, each referenced ingredient URL, and the actual relationship
+    // found (vs. the expected one).
+    fn ingredient_mismatch_msg(
+        claim: &Claim,
+        action_index: usize,
+        action_type: &str,
+        params: &assertions::ActionParameters,
+        expected_relationship: &str,
+    ) -> String {
+        let urls: Vec<String> = {
+            let mut v = Vec::new();
+            if let Some(h) = &params.ingredient {
+                v.push(h.url());
+            }
+            if let Some(hs) = &params.ingredients {
+                v.extend(hs.iter().map(|h| h.url()));
+            }
+            v
+        };
+
+        let details: Vec<String> = urls
+            .iter()
+            .map(|url| {
+                let found = assertion_label_from_uri(url).and_then(|target| {
+                    claim.ingredient_assertions().iter().find_map(|i| {
+                        if i.label() == target {
+                            Ingredient::from_assertion(i.assertion()).ok().map(|ing| {
+                                let rel = ing.relationship.as_str();
+                                let title = ing.title.as_deref().unwrap_or("<no title>");
+                                format!("'{}' (title='{}', relationship='{}')", url, title, rel)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                });
+                found.unwrap_or_else(|| format!("'{}' (not found in ingredient assertions)", url))
+            })
+            .collect();
+
+        format!(
+            "action[{}] ('{}') must have valid ingredient with {} relationship; ingredient(s): [{}]",
+            action_index,
+            action_type,
+            expected_relationship,
+            if details.is_empty() {
+                "none".to_string()
+            } else {
+                details.join(", ")
+            }
+        )
     }
 
     // Perform 2.x action validation check, hashed URI references are only checked
@@ -2178,7 +2225,7 @@ impl Claim {
                 Claim::verify_icons(claim, &icons, validation_log)?;
             }
 
-            for action in actions.actions() {
+            for (action_index, action) in actions.actions().iter().enumerate() {
                 //dbg!("action: {:?}", &action);
                 // 2.a action must have an action
                 if action.action().is_empty() {
@@ -2262,10 +2309,10 @@ impl Claim {
                             "verify_actions"
                         )
                         .validation_status(validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH)
-                        .failure_no_throw(
+                        .failure(
                             validation_log,
                             Error::ValidationRule("opened, placed and removed items must have ingredient(s) parameters".into()),
-                        );
+                        )?;
                         continue;
                     }
 
@@ -2278,10 +2325,10 @@ impl Claim {
                                 "verify_actions"
                             )
                             .validation_status(validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH)
-                            .failure_no_throw(
+                            .failure(
                                 validation_log,
                                 Error::ValidationRule("opened, placed and removed items must have ingredients parameter must be non empty array".into()),
-                            );
+                            )?;
                         }
                     }
 
@@ -2327,21 +2374,18 @@ impl Claim {
                         }
 
                         if found_good != 1 {
-                            log_item!(
-                                label.clone(),
-                                "opened must have valid ingredient with ParentOf relationship",
-                                "verify_actions"
-                            )
-                            .validation_status(
-                                validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
-                            )
-                            .failure_no_throw(
-                                validation_log,
-                                Error::ValidationRule(
-                                    "opened must have valid ingredient with ParentOf relationship"
-                                        .into(),
-                                ),
+                            let msg = Self::ingredient_mismatch_msg(
+                                claim,
+                                action_index,
+                                action.action(),
+                                params,
+                                "parentOf",
                             );
+                            log_item!(label.clone(), msg.clone(), "verify_actions")
+                                .validation_status(
+                                    validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
+                                )
+                                .failure_no_throw(validation_log, Error::ValidationRule(msg));
                         }
                     }
 
@@ -2390,21 +2434,64 @@ impl Claim {
                         }
 
                         if found_good != 1 {
-                            log_item!(
-                                label.clone(),
-                                "action must have valid ingredient with ComponentOf relationship",
-                                "verify_actions"
-                            )
-                            .validation_status(
-                                validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
-                            )
-                            .failure_no_throw(
-                                validation_log,
-                                Error::ValidationRule(
-                                    "action must have valid ingredient with ComponentOf relationship".into(),
-                                ),
+                            let msg = Self::ingredient_mismatch_msg(
+                                claim,
+                                action_index,
+                                action.action(),
+                                params,
+                                "componentOf",
                             );
+                            log_item!(label.clone(), msg.clone(), "verify_actions")
+                                .validation_status(
+                                    validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
+                                )
+                                .failure_no_throw(validation_log, Error::ValidationRule(msg));
                         }
+                    }
+                }
+
+                // 2.b.v c2pa.created must have a digitalSourceType
+                if action.action() == c2pa_action::CREATED && action.source_type().is_none() {
+                    log_item!(
+                        label.clone(),
+                        "c2pa.created action must have a digitalSourceType",
+                        "verify_actions"
+                    )
+                    .validation_status(validation_status::ASSERTION_ACTION_MALFORMED)
+                    .failure_no_throw(
+                        validation_log,
+                        Error::ValidationRule(
+                            "c2pa.created action must have a digitalSourceType".into(),
+                        ),
+                    );
+                }
+
+                // c2pa.translated must have sourceLanguage and targetLanguage parameters.
+                // Per the C2PA spec (18.15.4.7, Parameters): "When using a c2pa.translated
+                // action, the sourceLanguage and targetLanguage fields in the parameters
+                // object shall contain RFC 5646, BCP 47 language codes."
+                if action.action() == c2pa_action::TRANSLATED {
+                    let params = action.parameters();
+                    let source_language = params
+                        .and_then(|p| p.source_language.as_deref())
+                        .unwrap_or("");
+                    let target_language = params
+                        .and_then(|p| p.target_language.as_deref())
+                        .unwrap_or("");
+
+                    if source_language.is_empty() || target_language.is_empty() {
+                        log_item!(
+                            label.clone(),
+                            "c2pa.translated action must have sourceLanguage and targetLanguage parameters",
+                            "verify_actions"
+                        )
+                        .validation_status(validation_status::ASSERTION_ACTION_MALFORMED)
+                        .failure_no_throw(
+                            validation_log,
+                            Error::ValidationRule(
+                                "c2pa.translated action must have sourceLanguage and targetLanguage parameters".into(),
+                            ),
+                        );
                     }
                 }
 
@@ -2461,21 +2548,18 @@ impl Claim {
                         }
                         // will only exist if we actual tested for an ingredient
                         if let Some(false) = parent_tested {
-                            log_item!(
-                                label.clone(),
-                                "action must have valid ingredient with ParentOf relationship",
-                                "verify_actions"
-                            )
-                            .validation_status(
-                                validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
-                            )
-                            .failure_no_throw(
-                                validation_log,
-                                Error::ValidationRule(
-                                    "action must have valid ingredient with ParentOf relationship"
-                                        .into(),
-                                ),
+                            let msg = Self::ingredient_mismatch_msg(
+                                claim,
+                                action_index,
+                                action.action(),
+                                params,
+                                "parentOf",
                             );
+                            log_item!(label.clone(), msg.clone(), "verify_actions")
+                                .validation_status(
+                                    validation_status::ASSERTION_ACTION_INGREDIENT_MISMATCH,
+                                )
+                                .failure_no_throw(validation_log, Error::ValidationRule(msg));
                         }
                     }
                 }
@@ -2497,15 +2581,19 @@ impl Claim {
                                     {
                                         // The assertion may or may not be in the assertion store.
                                         // It can exist and be zeroed or be removed entirely
-                                        // but it must be in the claim's assertions HashUri list
-                                        parent_tested = Some(
-                                            ingredient_claim
-                                                .assertions()
-                                                .iter()
-                                                .any(|a| a.url().contains(&redaction_label)),
-                                        );
+                                        // but it must be in the claim's assertions HashUri list.
+                                        // For databox items, check the claim's redacted_assertions
+                                        // since databox refs are not in the assertions list.
+                                        let in_assertions = ingredient_claim
+                                            .assertions()
+                                            .iter()
+                                            .any(|a| a.url().contains(&redaction_label));
+                                        let in_redacted = redacted_uri.contains(DATABOX_STORE)
+                                            && claim
+                                                .redactions()
+                                                .is_some_and(|r| r.contains(redacted_uri));
+                                        parent_tested = Some(in_assertions || in_redacted);
                                     } else {
-                                        dbg!("failed here");
                                         parent_tested = Some(false);
                                     }
                                 }
@@ -2604,6 +2692,7 @@ impl Claim {
         asset_data: &mut ClaimAssetData<'_>,
         svi: &StoreValidationInfo,
         validation_log: &mut StatusTracker,
+        context: &Context,
     ) -> Result<()> {
         const UNNAMED: &str = "unnamed";
         let default_str = |s: &String| s.clone();
@@ -2696,17 +2785,33 @@ impl Claim {
                         }
 
                         // only verify local hashes here
+                        let mut cb = |step, total| {
+                            context.check_progress(ProgressPhase::VerifyingAssetHash, step, total)
+                        };
                         let hash_result = match asset_data {
                             #[cfg(feature = "file_io")]
                             ClaimAssetData::Path(asset_path) => {
-                                dh.verify_hash(asset_path, Some(claim.alg()))
+                                let mut file = std::fs::File::open(asset_path)?;
+                                dh.verify_stream_hash_with_progress(
+                                    &mut file,
+                                    Some(claim.alg()),
+                                    &mut cb,
+                                )
                             }
                             ClaimAssetData::Bytes(asset_bytes, _) => {
-                                dh.verify_in_memory_hash(asset_bytes, Some(claim.alg()))
+                                let mut cursor = std::io::Cursor::new(*asset_bytes);
+                                dh.verify_stream_hash_with_progress(
+                                    &mut cursor,
+                                    Some(claim.alg()),
+                                    &mut cb,
+                                )
                             }
-                            ClaimAssetData::Stream(stream_data, _) => {
-                                dh.verify_stream_hash(*stream_data, Some(claim.alg()))
-                            }
+                            ClaimAssetData::Stream(stream_data, _) => dh
+                                .verify_stream_hash_with_progress(
+                                    *stream_data,
+                                    Some(claim.alg()),
+                                    &mut cb,
+                                ),
                             _ => return Err(Error::UnsupportedType), /* this should never happen (coding error) */
                         };
 
@@ -2758,29 +2863,42 @@ impl Claim {
 
                     let name = dh.name().map_or("unnamed".to_string(), default_str);
 
+                    let mut step = 0u32;
+                    let mut cb = |_s: u32, t: u32| {
+                        step += 1;
+                        context.check_progress(ProgressPhase::VerifyingAssetHash, step, t)
+                    };
                     let hash_result = match asset_data {
                         #[cfg(feature = "file_io")]
                         ClaimAssetData::Path(asset_path) => {
-                            dh.verify_hash(asset_path, Some(claim.alg()))
+                            dh.verify_hash_with_progress(asset_path, Some(claim.alg()), &mut cb)
                         }
-                        ClaimAssetData::Bytes(asset_bytes, _) => {
-                            dh.verify_in_memory_hash(asset_bytes, Some(claim.alg()))
-                        }
-                        ClaimAssetData::Stream(stream_data, _) => {
-                            dh.verify_stream_hash(*stream_data, Some(claim.alg()))
-                        }
+                        ClaimAssetData::Bytes(asset_bytes, _) => dh
+                            .verify_in_memory_hash_with_progress(
+                                asset_bytes,
+                                Some(claim.alg()),
+                                &mut cb,
+                            ),
+                        ClaimAssetData::Stream(stream_data, _) => dh
+                            .verify_stream_hash_with_progress(
+                                *stream_data,
+                                Some(claim.alg()),
+                                &mut cb,
+                            ),
                         ClaimAssetData::StreamFragment(initseg_data, fragment_data, _) => dh
-                            .verify_stream_segment(
+                            .verify_stream_segment_with_progress(
                                 *initseg_data,
                                 *fragment_data,
                                 Some(claim.alg()),
+                                &mut cb,
                             ),
                         #[cfg(feature = "file_io")]
                         ClaimAssetData::StreamFragments(initseg_data, fragment_paths, _) => dh
-                            .verify_stream_segments(
+                            .verify_stream_segments_with_progress(
                                 *initseg_data,
                                 fragment_paths,
                                 Some(claim.alg()),
+                                &mut cb,
                             ),
                     };
 
@@ -2828,6 +2946,9 @@ impl Claim {
                     // handle BMFF data hashes
                     let bh = BoxHash::from_assertion(hash_binding_assertion.assertion())?;
 
+                    let mut cb = |step, total| {
+                        context.check_progress(ProgressPhase::VerifyingAssetHash, step, total)
+                    };
                     let hash_result = match asset_data {
                         #[cfg(feature = "file_io")]
                         ClaimAssetData::Path(asset_path) => {
@@ -2839,7 +2960,13 @@ impl Claim {
                                         "Box hash not supported".to_string(),
                                     ))?;
 
-                            bh.verify_hash(asset_path, Some(claim.alg()), box_hash_processor)
+                            let mut file = std::fs::File::open(asset_path)?;
+                            bh.verify_stream_hash_with_progress(
+                                &mut file,
+                                Some(claim.alg()),
+                                box_hash_processor,
+                                &mut cb,
+                            )
                         }
                         ClaimAssetData::Bytes(asset_bytes, asset_type) => {
                             let box_hash_processor = get_assetio_handler(asset_type)
@@ -2849,10 +2976,12 @@ impl Claim {
                                     "Box hash not supported for: {asset_type}"
                                 )))?;
 
-                            bh.verify_in_memory_hash(
-                                asset_bytes,
+                            let mut cursor = std::io::Cursor::new(*asset_bytes);
+                            bh.verify_stream_hash_with_progress(
+                                &mut cursor,
                                 Some(claim.alg()),
                                 box_hash_processor,
+                                &mut cb,
                             )
                         }
                         ClaimAssetData::Stream(stream_data, asset_type) => {
@@ -2863,10 +2992,11 @@ impl Claim {
                                     "Box hash not supported for: {asset_type}"
                                 )))?;
 
-                            bh.verify_stream_hash(
+                            bh.verify_stream_hash_with_progress(
                                 *stream_data,
                                 Some(claim.alg()),
                                 box_hash_processor,
+                                &mut cb,
                             )
                         }
                         _ => return Err(Error::UnsupportedType),
@@ -2917,11 +3047,10 @@ impl Claim {
 
     fn verify_internal(
         claim: &Claim,
-        asset_data: &mut ClaimAssetData<'_>,
         svi: &StoreValidationInfo,
         verified: Result<CertificateInfo>,
         validation_log: &mut StatusTracker,
-        settings: &Settings,
+        context: &Context,
     ) -> Result<()> {
         // signature check
         match verified {
@@ -3241,11 +3370,8 @@ impl Claim {
             });
         }
 
-        // verify data hashes for provenance claims
-        Claim::verify_hash_binding(claim, asset_data, svi, validation_log)?;
-
         // check action rules
-        Claim::verify_actions(claim, svi, validation_log, settings)?;
+        Claim::verify_actions(claim, svi, validation_log, context.settings())?;
 
         // check metadata rules
         if claim.version() >= 2 {
@@ -3434,7 +3560,14 @@ impl Claim {
             )));
         }
 
-        // redact assertion from incoming ingredients
+        // Redact assertion from incoming ingredients
+        // Only apply redactions that match claims in the current ingredient batch,
+        // redactions targeting other ingredients will be applied when those are processed
+        // (otherwise can't find them).
+        // TODO: per C2PA 2.4 spec, when redacting an ingredient assertion that references
+        // a C2PA Manifest, the associated manifest should be removed from the Manifest Store
+        // if no other references to it remain. This was also TODO'ed before...
+        let mut applied_redactions = Vec::new();
         if let Some(redactions) = &redactions_opt {
             for redaction in redactions {
                 if let Some(claim) = ingredient
@@ -3442,16 +3575,19 @@ impl Claim {
                     .find(|x| redaction.contains(x.label()))
                 {
                     claim.redact_assertion(redaction)?;
-
-                    // if this is an ingredient we should remove the ingredient
-                } else {
-                    return Err(Error::AssertionRedactionNotFound);
+                    applied_redactions.push(redaction.clone());
                 }
             }
         }
 
-        // all have been removed (if necessary) so replace redaction list
-        self.redacted_assertions = redactions_opt;
+        // accumulate applied redactions across multiple ingredient batches
+        match &mut self.redacted_assertions {
+            Some(existing) => existing.extend(applied_redactions),
+            None if !applied_redactions.is_empty() => {
+                self.redacted_assertions = Some(applied_redactions);
+            }
+            _ => {}
+        }
 
         // just replace the ingredients with new once since conflicts are resolved by the caller
         for i in ingredient {
@@ -4223,5 +4359,361 @@ pub mod tests {
         }
 
         Ok(())
+    }
+
+    /// When a claim has two assertions whose labels share a prefix
+    /// (e.g. `c2pa.thumbnail.ingredient` and `c2pa.thumbnail.ingredient__1`),
+    /// redacting the `__1` URI must remove only the `__1` instance and leave
+    /// the base instance intact, not vice-versa.
+    #[test]
+    fn test_redact_assertion_exact_label_match_with_shared_prefix() {
+        use crate::{
+            assertions::{labels, EmbeddedData},
+            jumbf::labels::to_assertion_uri,
+        };
+
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+
+        // Add two ingredient thumbnails — the second gets the `__1` suffix.
+        let thumb0 = EmbeddedData::new(labels::INGREDIENT_THUMBNAIL, "image/jpeg", vec![0u8; 4]);
+        let thumb1 = EmbeddedData::new(labels::INGREDIENT_THUMBNAIL, "image/jpeg", vec![1u8; 4]);
+        claim.add_assertion(&thumb0).expect("add thumb0");
+        claim.add_assertion(&thumb1).expect("add thumb1");
+
+        // Both labels must be here
+        assert!(
+            claim
+                .get_assertion(labels::INGREDIENT_THUMBNAIL, 0)
+                .is_some(),
+            "instance 0 should exist"
+        );
+        assert!(
+            claim
+                .get_assertion(labels::INGREDIENT_THUMBNAIL, 1)
+                .is_some(),
+            "instance 1 should exist"
+        );
+
+        let manifest_label = claim.label();
+        let uri_base = to_assertion_uri(manifest_label, labels::INGREDIENT_THUMBNAIL);
+        let uri_instance1 = to_assertion_uri(
+            manifest_label,
+            &format!("{}__1", labels::INGREDIENT_THUMBNAIL),
+        );
+
+        // Order is important here, first redact the __1 URI
+        claim
+            .redact_assertion(&uri_instance1)
+            .expect("redact instance 1 should succeed");
+
+        // The URI without the __1 (base) should still be here
+        assert!(
+            claim
+                .get_assertion(labels::INGREDIENT_THUMBNAIL, 0)
+                .is_some(),
+            "instance 0 must still exist after redacting instance 1"
+        );
+
+        // Now redact the base
+        claim
+            .redact_assertion(&uri_base)
+            .expect("redact base instance should succeed");
+
+        // Both URIs must be gone now
+        assert!(
+            claim
+                .get_assertion(labels::INGREDIENT_THUMBNAIL, 0)
+                .is_none(),
+            "instance 0 should be gone"
+        );
+        assert!(
+            claim
+                .get_assertion(labels::INGREDIENT_THUMBNAIL, 1)
+                .is_none(),
+            "instance 1 should be gone"
+        );
+    }
+
+    #[test]
+    fn test_redact_databox_exact_label_match_with_shared_prefix() {
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+
+        // Add two databoxes to force multiple URIs
+        let uri0 = claim
+            .add_databox("application/octet-stream", vec![0u8; 4], None)
+            .expect("add databox 0");
+        let uri1 = claim
+            .add_databox("application/octet-stream", vec![1u8; 4], None)
+            .expect("add databox 1");
+
+        let has_databox = |claim: &Claim, uri: &HashedUri| {
+            claim.databoxes().iter().any(|(x, _d)| x.url() == uri.url())
+        };
+
+        assert!(has_databox(&claim, &uri0), "databox 0 should exist");
+        assert!(has_databox(&claim, &uri1), "databox 1 should exist");
+
+        // Check labels
+        assert!(
+            uri0.url().ends_with("/c2pa.data"),
+            "expected databox 0 to be labeled `c2pa.data`, got {}",
+            uri0.url()
+        );
+        assert!(
+            uri1.url().ends_with("/c2pa.data__1"),
+            "expected databox 1 to be labeled `c2pa.data__1`, got {}",
+            uri1.url()
+        );
+
+        // Order is important here in our test.
+        // redact the `__1` URI first, to make sure we exact-match.
+        claim
+            .redact_assertion(&uri1.url())
+            .expect("redact databox 1 should succeed");
+
+        assert!(
+            has_databox(&claim, &uri0),
+            "databox 0 must still exist after redacting databox 1"
+        );
+        assert!(!has_databox(&claim, &uri1), "databox 1 should be gone");
+
+        // Now redact the base (which should be still here, since the other exact-matched).
+        claim
+            .redact_assertion(&uri0.url())
+            .expect("redact databox 0 should succeed");
+
+        assert!(!has_databox(&claim, &uri0), "databox 0 should be gone");
+        assert!(!has_databox(&claim, &uri1), "databox 1 should be gone");
+    }
+
+    #[test]
+    fn test_redact_databox_from_other_manifest_returns_not_found() {
+        use crate::jumbf::labels::to_databox_uri;
+
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+
+        let uri0 = claim
+            .add_databox("application/octet-stream", vec![0u8; 4], None)
+            .expect("add databox 0");
+
+        let foreign_uri =
+            to_databox_uri("urn:uuid:00000000-0000-0000-0000-000000000000", "c2pa.data");
+        assert_ne!(foreign_uri, uri0.url(), "test setup: URIs must differ");
+
+        let result = claim.redact_assertion(&foreign_uri);
+        assert!(
+            matches!(result, Err(Error::AssertionRedactionNotFound)),
+            "cross-manifest redaction should fail, got {result:?}"
+        );
+
+        assert!(
+            claim
+                .databoxes()
+                .iter()
+                .any(|(x, _d)| x.url() == uri0.url()),
+            "databox 0 should have survived a redaction targeting another manifest"
+        );
+    }
+
+    #[test]
+    fn test_redact_assertion_instance_labels_are_exact() {
+        use crate::{assertions::UserCbor, jumbf::labels::to_assertion_uri};
+
+        const LABEL: &str = "com.example.a";
+
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+        for n in 0..3 {
+            claim
+                .add_assertion(&UserCbor::new(
+                    LABEL,
+                    c2pa_cbor::to_vec(&format!("payload {n}")).unwrap(),
+                ))
+                .expect("add assertion");
+        }
+
+        let stored = |claim: &Claim| -> Vec<String> {
+            claim
+                .claim_assertion_store()
+                .iter()
+                .map(|x| Claim::label_with_instance(&x.label_raw(), x.instance()))
+                .collect()
+        };
+
+        assert_eq!(
+            stored(&claim),
+            vec!["com.example.a", "com.example.a__1", "com.example.a__2"],
+            "test setup: three instances of the same label"
+        );
+
+        // Redact `__2` first: the `__1` and base labels share its prefix and must survive.
+        claim
+            .redact_assertion(&to_assertion_uri(claim.label(), "com.example.a__2"))
+            .expect("redact instance 2");
+        assert_eq!(
+            stored(&claim),
+            vec!["com.example.a", "com.example.a__1"],
+            "only instance 2 should have been removed"
+        );
+
+        claim
+            .redact_assertion(&to_assertion_uri(claim.label(), "com.example.a__1"))
+            .expect("redact instance 1");
+        assert_eq!(
+            stored(&claim),
+            vec!["com.example.a"],
+            "only instance 1 should have been removed"
+        );
+
+        claim
+            .redact_assertion(&to_assertion_uri(claim.label(), LABEL))
+            .expect("redact base instance");
+        assert!(claim.claim_assertion_store().is_empty());
+    }
+
+    /// `com.example.meta` is a prefix of `com.example.metadata` but is not the same
+    /// assertion, so redacting it must not match.
+    #[test]
+    fn test_redact_assertion_prefix_is_not_a_match() {
+        use crate::{assertions::UserCbor, jumbf::labels::to_assertion_uri};
+
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+        claim
+            .add_assertion(&UserCbor::new(
+                "com.example.metadata",
+                c2pa_cbor::to_vec(&"payload").unwrap(),
+            ))
+            .expect("add assertion");
+
+        let uri = to_assertion_uri(claim.label(), "com.example.meta");
+        let result = claim.redact_assertion(&uri);
+        assert!(
+            matches!(result, Err(Error::AssertionRedactionNotFound)),
+            "a prefix of a stored label must not match, got {result:?}"
+        );
+        assert_eq!(
+            claim.claim_assertion_store().len(),
+            1,
+            "the assertion must survive a non-matching redaction"
+        );
+    }
+
+    #[test]
+    fn test_redact_assertion_suffix_label_is_not_a_match() {
+        use crate::{assertions::UserCbor, jumbf::labels::to_assertion_uri};
+
+        let mut claim = Claim::new("unit test", Some("test"), 2);
+        for label in ["example.a", "org.example.a"] {
+            claim
+                .add_assertion(&UserCbor::new(
+                    label,
+                    c2pa_cbor::to_vec(&"payload").unwrap(),
+                ))
+                .expect("add assertion");
+        }
+
+        claim
+            .redact_assertion(&to_assertion_uri(claim.label(), "org.example.a"))
+            .expect("redact org.example.a");
+
+        let remaining: Vec<String> = claim
+            .claim_assertion_store()
+            .iter()
+            .map(|x| Claim::label_with_instance(&x.label_raw(), x.instance()))
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["example.a"],
+            "redacting `org.example.a` must not remove the `example.a` assertion"
+        );
+    }
+
+    /// Verify comparison conditions.
+    #[test]
+    fn test_redact_assertion_label_from_link_round_trip() {
+        for label in [
+            "com.example.a",
+            "com.example.a__1",
+            "c2pa.thumbnail.ingredient__3.jpeg",
+            "c2pa.thumbnail.claim.jpeg__1",
+            "stds.schema-org.CreativeWork__2",
+            "c2pa.data",
+            "c2pa.data__1",
+        ] {
+            let (parsed, instance) = Claim::assertion_label_from_link(label);
+            assert_eq!(
+                Claim::label_with_instance(&parsed, instance),
+                label,
+                "label normalization must round-trip for {label}"
+            );
+        }
+    }
+
+    // Builds a v2 claim whose created assertions contain a valid c2pa.created
+    // action followed by the given c2pa.translated action, runs verify_actions,
+    // and returns the validation log for status-code checks.
+    fn verify_translated_action(translated: Action) -> StatusTracker {
+        use crate::assertions::DigitalSourceType;
+
+        // A valid first action (created + digitalSourceType) keeps the claim
+        // otherwise clean, so the only possible malformed status comes from the
+        // c2pa.translated action under test.
+        let mut claim = Claim::new("test", Some("test"), 2);
+        let actions = Actions::new()
+            .add_action(
+                Action::new(c2pa_action::CREATED)
+                    .set_source_type(DigitalSourceType::AlgorithmicMedia),
+            )
+            .add_action(translated);
+        claim.add_assertion(&actions).expect("add actions");
+
+        let svi = StoreValidationInfo::default();
+        let settings = Settings::default();
+        let mut validation_log =
+            StatusTracker::with_error_behavior(ErrorBehavior::ContinueWhenPossible);
+        Claim::verify_actions(&claim, &svi, &mut validation_log, &settings)
+            .expect("verify_actions should not throw");
+        validation_log
+    }
+
+    // Regression: per C2PA spec 18.15.4.7, a c2pa.translated action's parameters
+    // must contain sourceLanguage and targetLanguage. An action with empty
+    // parameters must be reported as assertion.action.malformed.
+    #[test]
+    fn test_verify_translated_action_missing_languages() {
+        let log = verify_translated_action(Action::new(c2pa_action::TRANSLATED));
+        assert!(
+            log.has_status(validation_status::ASSERTION_ACTION_MALFORMED),
+            "c2pa.translated without sourceLanguage/targetLanguage should be malformed"
+        );
+    }
+
+    // A c2pa.translated action with only one of the two language codes is still
+    // malformed.
+    #[test]
+    fn test_verify_translated_action_partial_languages() {
+        let translated = Action::new(c2pa_action::TRANSLATED)
+            .set_parameter("source_language", "en-US")
+            .expect("set source_language");
+        let log = verify_translated_action(translated);
+        assert!(
+            log.has_status(validation_status::ASSERTION_ACTION_MALFORMED),
+            "c2pa.translated with only sourceLanguage should be malformed"
+        );
+    }
+
+    // Positive: a c2pa.translated action with both BCP-47 language codes present
+    // must not be reported as malformed.
+    #[test]
+    fn test_verify_translated_action_with_languages_valid() {
+        let translated = Action::new(c2pa_action::TRANSLATED)
+            .set_parameter("source_language", "en-US")
+            .expect("set source_language")
+            .set_parameter("target_language", "fr-FR")
+            .expect("set target_language");
+        let log = verify_translated_action(translated);
+        assert!(
+            !log.has_status(validation_status::ASSERTION_ACTION_MALFORMED),
+            "c2pa.translated with both languages should not be malformed"
+        );
     }
 }

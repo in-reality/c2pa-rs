@@ -16,6 +16,27 @@
 #![allow(clippy::unwrap_used)]
 
 mod claim_aggregation;
+#[cfg(not(target_arch = "wasm32"))]
+mod embeddable_signing;
 mod examples;
 pub(crate) mod fixtures;
 mod validation_method;
+
+/// Read a manifest store with identity assertion decoding disabled so the raw
+/// assertion bytes are preserved for manual validation in tests.
+pub(crate) async fn read_manifest<R: std::io::Read + std::io::Seek + Send>(
+    format: &str,
+    source: &mut R,
+) -> crate::Reader {
+    let settings = crate::settings::Settings::default()
+        .with_value("core.decode_identity_assertions", false)
+        .unwrap();
+    let context = crate::Context::new()
+        .with_settings(settings)
+        .unwrap()
+        .into_shared();
+    crate::Reader::from_shared_context(&context)
+        .with_stream_async(format, source)
+        .await
+        .unwrap()
+}
