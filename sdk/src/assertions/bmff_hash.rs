@@ -2574,7 +2574,6 @@ pub fn compute_bmff_mdat_merkle_roots(
     Ok(roots)
 }
 
-
 #[cfg(test)]
 mod bmff_hash_tests {
     #![allow(clippy::expect_used)]

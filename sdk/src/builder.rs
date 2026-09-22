@@ -11006,7 +11006,7 @@ mod tests {
         Ok(())
     }
 
-// Tests for the experimental `filter_actions` / `filter_ingredients` API. Kept in a
+    // Tests for the experimental `filter_actions` / `filter_ingredients` API. Kept in a
     // feature-gated submodule so the whole suite compiles only when the feature is enabled.
     #[cfg(feature = "unstable_builder_filter")]
     mod filter_tests {
