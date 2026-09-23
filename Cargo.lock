@@ -680,7 +680,7 @@ name = "c2pa_macros"
 version = "0.90.19"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
