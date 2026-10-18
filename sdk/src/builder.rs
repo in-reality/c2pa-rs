@@ -1430,15 +1430,19 @@ impl Builder {
             let mut file = zip
                 .by_index(i)
                 .map_err(|e| Error::OtherError(Box::new(e)))?;
+            // zip 9 returns the entry name as a result: non-UTF-8 names are an error.
+            let name = file
+                .name()
+                .map_err(|e| Error::OtherError(Box::new(e)))?
+                .into_owned();
 
-            if file.name().starts_with("resources/") && file.name() != "resources/" {
+            if name.starts_with("resources/") && name != "resources/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let id = file
-                    .name()
+                let id = name
                     .split('/')
                     .nth(1)
                     .ok_or(Error::BadParam("Invalid resource path".to_string()))?;
@@ -1452,14 +1456,13 @@ impl Builder {
 
             // Load the c2pa_manifests.
             // Adds the manifest data to any ingredient that has a matching active_manfiest label.
-            if file.name().starts_with("manifests/") && file.name() != "manifests/" {
+            if name.starts_with("manifests/") && name != "manifests/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let manifest_label = file
-                    .name()
+                let manifest_label = name
                     .split('/')
                     .nth(1)
                     .ok_or(Error::BadParam("Invalid manifest path".to_string()))?;
@@ -1479,20 +1482,19 @@ impl Builder {
 
             // Keep this for temporary unstable api support (un-versioned).
             // Earlier method used numbered library folders instead of manifests.
-            if file.name().starts_with("ingredients/") && file.name() != "ingredients/" {
+            if name.starts_with("ingredients/") && name != "ingredients/" {
                 // Validate the full path from the archive to prevent path traversal
-                let _sanitized_path = sanitize_archive_path(file.name())?;
+                let _sanitized_path = sanitize_archive_path(&name)?;
 
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                let index: usize = file
-                    .name()
+                let index: usize = name
                     .split('/')
                     .nth(1)
                     .ok_or_else(|| Error::BadParam("Invalid ingredient path".to_string()))?
                     .parse::<usize>()
                     .map_err(|_| Error::BadParam("Invalid ingredient path".to_string()))?;
-                let id = file.name().split('/').nth(2).unwrap_or_default();
+                let id = name.split('/').nth(2).unwrap_or_default();
 
                 // Sanitize id to prevent path traversal via stored key
                 let sanitized_id = if !id.is_empty() {
