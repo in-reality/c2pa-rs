@@ -778,10 +778,11 @@ impl Ingredient {
     /// This allows you to predefine fields before adding the stream.
     /// Sets manifest_data if the stream contains a manifest_store.
     /// Sets thumbnail if not defined and a valid claim thumbnail is found or add_thumbnails is enabled.
-    /// Instance_id, document_id, and provenance will be overridden if found in the stream.
+    /// A supplied instance ID is preserved; document ID and provenance are read from the stream.
+    /// Existing manifest data is verified against this media using the supplied context.
     /// Format will be overridden only if it is the default (application/octet-stream).
     #[async_generic]
-    pub(crate) fn with_stream<S: Into<String>>(
+    pub fn with_stream<S: Into<String>>(
         mut self,
         format: S,
         stream: &mut dyn CAIRead,
@@ -1778,6 +1779,33 @@ mod tests {
         assert!(ingredient.manifest_data().is_some());
         assert_eq!(ingredient.metadata(), None);
         assert_eq!(ingredient.validation_status(), None);
+    }
+
+    #[test]
+    fn detached_store_import_uses_media_and_explicit_context() {
+        let context = Context::new()
+            .with_settings(serde_json::json!({
+                "builder": { "thumbnail": { "enabled": false } },
+                "verify": { "remote_manifest_fetch": false }
+            }))
+            .unwrap();
+        let (format, mut media, _) = create_test_streams("C.jpg");
+        let embedded = Ingredient::new_v2("capture", format)
+            .with_stream(format, &mut media, &context)
+            .unwrap();
+        let store = embedded.manifest_data().unwrap().into_owned();
+        let mut detached = Ingredient::new_v2("Original photo", format);
+        detached.set_instance_id("xmp:iid:internal-parent-hash");
+        detached.set_manifest_data(store).unwrap();
+        let detached = detached.with_stream(format, &mut media, &context).unwrap();
+        assert_eq!(detached.instance_id(), "xmp:iid:internal-parent-hash");
+        assert_eq!(detached.active_manifest(), embedded.active_manifest());
+        assert!(detached.active_manifest().is_some());
+        let recorded = serde_json::to_string(&detached).unwrap();
+        assert!(
+            !recorded.contains("assertion.dataHash.mismatch"),
+            "{recorded}"
+        );
     }
 
     #[cfg(feature = "add_thumbnails")]
