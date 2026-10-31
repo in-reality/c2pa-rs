@@ -1591,11 +1591,7 @@ struct IngredientStoreResolver {
 impl StoreResolver for IngredientStoreResolver {
     fn get(&self, uri: &str) -> Option<crate::Result<Vec<u8>>> {
         if uri.contains(DATABOXES) {
-            let label = manifest_label_from_uri(uri)?;
-            let hashed_uri = HashedUri::new(uri.to_owned(), None, &[]);
-            return self
-                .store
-                .get_data_box_from_uri_and_claim(&hashed_uri, &label)
+            return crate::resource_store::data_box_by_uri(&self.store, uri)
                 .map(|db| Ok(db.data.clone()));
         }
         if uri.contains(ASSERTIONS) {
@@ -1612,6 +1608,23 @@ impl StoreResolver for IngredientStoreResolver {
         None
     }
 
+    fn len(&self, uri: &str) -> Option<crate::Result<u64>> {
+        if uri.contains(DATABOXES) {
+            return crate::resource_store::data_box_by_uri(&self.store, uri)
+                .map(|db| Ok(db.data.len() as u64));
+        }
+        if uri.contains(ASSERTIONS) {
+            return self
+                .store
+                .get_assertion_from_uri(uri)
+                .map(|assertion| Ok(assertion.data().len() as u64));
+        }
+        if self.store.get_claim(uri).is_some() {
+            return Some(Err(Error::UnsupportedType));
+        }
+        None
+    }
+
     fn has(&self, uri: &str) -> bool {
         if uri.contains(ASSERTIONS) {
             self.store
@@ -1619,11 +1632,7 @@ impl StoreResolver for IngredientStoreResolver {
                 .map(|a| matches!(a.decode_data(), AssertionData::Binary(_)))
                 .unwrap_or(false)
         } else if uri.contains(DATABOXES) {
-            let hr = HashedUri::new(uri.to_owned(), None, &[]);
-            let label = manifest_label_from_uri(uri).unwrap_or_default();
-            self.store
-                .get_data_box_from_uri_and_claim(&hr, &label)
-                .is_some()
+            crate::resource_store::data_box_by_uri(&self.store, uri).is_some()
         } else {
             self.store.get_claim(uri).is_some()
         }

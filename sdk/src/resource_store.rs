@@ -31,13 +31,14 @@ use {
 };
 
 use crate::{
-    assertions::{labels, AssetType, EmbeddedData},
+    assertions::{labels, AssetType, DataBox, EmbeddedData},
     asset_io::CAIRead,
     claim::Claim,
     error::Error,
     hashed_uri::HashedUri,
-    jumbf::labels::{to_absolute_uri, DATABOXES},
+    jumbf::labels::{manifest_label_from_uri, to_absolute_uri, DATABOXES},
     maybe_send_sync::{MaybeSend, MaybeSync},
+    store::Store,
     utils::mime::format_to_mime,
     Result,
 };
@@ -180,6 +181,19 @@ pub struct ResourceStore {
     resolver: Option<Arc<dyn StoreResolver>>,
 }
 
+/// Select the stored hashed reference for a resource URI. A ResourceRef carries
+/// no hash; constructing an empty-hash HashedUri would fail get_databox's hash
+/// comparison. Reuse the store's reference without changing that comparison.
+pub(crate) fn data_box_by_uri<'a>(store: &'a Store, uri: &str) -> Option<&'a DataBox> {
+    let label = manifest_label_from_uri(uri)?;
+    let claim = store.get_claim(&label)?;
+    let (reference, _) = claim
+        .databoxes()
+        .iter()
+        .find(|(reference, _)| reference.url() == uri)?;
+    store.get_data_box_from_uri_and_claim(reference, &label)
+}
+
 /// A pluggable resolver that lets [`ResourceStore`] look up resource bytes from an
 /// external source (e.g. a parsed [`Store`][crate::store::Store]) without eagerly copying them.
 ///
@@ -188,6 +202,9 @@ pub struct ResourceStore {
 /// - [`keys`][StoreResolver::keys]: Enumerates binary resource URIs visible through this resolver.
 pub(crate) trait StoreResolver: std::fmt::Debug + MaybeSend + MaybeSync {
     fn get(&self, uri: &str) -> Option<crate::Result<Vec<u8>>>;
+    /// Inspect the selected resource without copying or serializing its bytes.
+    /// None means unknown; a recognized unsized resource returns Some(Err).
+    fn len(&self, uri: &str) -> Option<crate::Result<u64>>;
     fn has(&self, uri: &str) -> bool;
     fn keys(&self) -> Vec<String>;
 }
@@ -202,6 +219,10 @@ struct ChainedResolver {
 impl StoreResolver for ChainedResolver {
     fn get(&self, uri: &str) -> Option<crate::Result<Vec<u8>>> {
         self.primary.get(uri).or_else(|| self.fallback.get(uri))
+    }
+
+    fn len(&self, uri: &str) -> Option<crate::Result<u64>> {
+        self.primary.len(uri).or_else(|| self.fallback.len(uri))
     }
 
     fn has(&self, uri: &str) -> bool {
@@ -350,6 +371,30 @@ impl ResourceStore {
     /// Returns a [`HashMap`] of internal resources.
     pub fn resources(&self) -> &HashMap<String, Vec<u8>> {
         &self.resources
+    }
+
+    /// Returns the resource byte length without materializing lazy data.
+    ///
+    /// Lookup precedence matches [`Self::get`]. Known manifest references that
+    /// require flattening return [`Error::UnsupportedType`]; unknown resources
+    /// return [`Error::ResourceNotFound`]. File-backed resources use metadata
+    /// within the same confined root as reads. Their contents may change after
+    /// this check, so callers should also bound the subsequent output stream.
+    pub fn resource_len(&self, id: &str) -> Result<u64> {
+        if let Some(data) = self.resources.get(id) {
+            return Ok(data.len() as u64);
+        }
+        #[cfg(feature = "file_io")]
+        if let Some(base) = self.base_path.as_ref() {
+            let root = self.resource_root.as_deref().unwrap_or(base);
+            let path = resolve_within_root(base, root, id)
+                .map_err(|_| Error::ResourceNotFound(id.to_owned()))?;
+            return Ok(std::fs::metadata(path)?.len());
+        }
+        self.resolver
+            .as_ref()
+            .and_then(|r| r.len(id))
+            .unwrap_or_else(|| Err(Error::ResourceNotFound(id.to_owned())))
     }
 
     /// Returns a copy on write reference to the resource if found.
@@ -612,6 +657,139 @@ mod tests {
     use crate::{
         crypto::raw_signature::SigningAlg, utils::test_signer::test_signer, Builder, Reader,
     };
+
+    #[test]
+    fn resource_len_never_materializes_and_preserves_precedence() {
+        #[derive(Debug)]
+        struct LengthOnly {
+            length: u64,
+            unsupported: bool,
+        }
+        impl StoreResolver for LengthOnly {
+            fn get(&self, _: &str) -> Option<Result<Vec<u8>>> {
+                panic!("length preflight must not materialize")
+            }
+            fn len(&self, id: &str) -> Option<Result<u64>> {
+                if id == "missing" || (id == "fallback" && self.length == 3) {
+                    return None;
+                }
+                Some(if self.unsupported {
+                    Err(Error::UnsupportedType)
+                } else {
+                    Ok(self.length)
+                })
+            }
+            fn has(&self, id: &str) -> bool {
+                id != "missing"
+            }
+            fn keys(&self) -> Vec<String> {
+                vec![]
+            }
+        }
+        let mut store = ResourceStore::new();
+        store.set_resolver(Arc::new(LengthOnly {
+            length: u64::MAX,
+            unsupported: false,
+        }));
+        assert_eq!(store.resource_len("lazy").unwrap(), u64::MAX);
+        store.add("resident", vec![1, 2, 3]).unwrap();
+        store.add("empty", vec![]).unwrap();
+        assert_eq!(store.resource_len("resident").unwrap(), 3);
+        assert_eq!(store.resource_len("empty").unwrap(), 0);
+        assert!(matches!(
+            store.resource_len("missing"),
+            Err(Error::ResourceNotFound(_))
+        ));
+        let chain = ChainedResolver {
+            primary: Arc::new(LengthOnly {
+                length: 3,
+                unsupported: true,
+            }),
+            fallback: Arc::new(LengthOnly {
+                length: 1,
+                unsupported: false,
+            }),
+        };
+        assert!(matches!(
+            chain.len("known"),
+            Some(Err(Error::UnsupportedType))
+        ));
+        let chain = ChainedResolver {
+            primary: Arc::new(LengthOnly {
+                length: 3,
+                unsupported: false,
+            }),
+            fallback: Arc::new(LengthOnly {
+                length: 1,
+                unsupported: false,
+            }),
+        };
+        assert_eq!(chain.len("known").unwrap().unwrap(), 3);
+        assert_eq!(chain.len("fallback").unwrap().unwrap(), 1);
+        assert!(chain.len("missing").is_none());
+    }
+
+    #[test]
+    fn serialized_manifest_cannot_forge_current_validation_projection() {
+        let manifest: crate::Manifest = serde_json::from_value(serde_json::json!({
+            "claim_generator":"test", "validation_status":[{"code":"forged.failure"}]
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(manifest).unwrap();
+        assert!(serialized.get("validation_status").is_none());
+    }
+
+    #[test]
+    fn resource_len_reads_lazy_databox_metadata() {
+        let mut claim = Claim::new("test", None, 1);
+        let reference = claim
+            .add_databox("image/jpeg", vec![1, 2, 3], None)
+            .unwrap();
+        let label = claim.label().to_owned();
+        let wrong_hash = HashedUri::new(reference.url(), None, &[]);
+        assert!(
+            claim.get_databox(&wrong_hash).is_none(),
+            "hash validation remains strict"
+        );
+        let mut backing = crate::store::Store::new();
+        backing.commit_claim(claim).unwrap();
+        let backing = Arc::new(backing);
+        let mut manifest = crate::Manifest::new("test");
+        manifest.set_store_resolver(backing.clone());
+        let mut ingredient = crate::Ingredient::new_v2("test", "image/jpeg");
+        ingredient.set_store_resolver(backing);
+        for resources in [manifest.resources(), ingredient.resources()] {
+            assert!(resources.resources().is_empty());
+            assert_eq!(resources.resource_len(&reference.url()).unwrap(), 3);
+            assert!(resources.exists(&reference.url()));
+            assert!(resources.resources().is_empty());
+            assert_eq!(
+                resources.get(&reference.url()).unwrap().as_slice(),
+                &[1, 2, 3]
+            );
+        }
+        assert!(matches!(
+            ingredient.resources().resource_len(&label),
+            Err(Error::UnsupportedType)
+        ));
+    }
+
+    #[cfg(feature = "file_io")]
+    #[test]
+    fn resource_len_confines_file_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ResourceStore::new();
+        store.set_base_path(temp.path());
+        store.add("image", vec![1, 2, 3]).unwrap();
+        assert_eq!(store.resource_len("image").unwrap(), 3);
+        assert!(store.resource_len("../outside").is_err());
+        #[cfg(unix)]
+        {
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("escape")).unwrap();
+            assert!(store.resource_len("escape").is_err());
+        }
+    }
 
     #[test]
     fn resource_store() {

@@ -92,3 +92,38 @@ from manifest store bytes synchronously; upstream removed the sync API.
 - Android `i686` type fix — retained; upstream still uses bare `set_time(st)`.
 - BMFF integer-overflow / underflow hardening — upstream merged equivalent fixes.
 - Ingredient label collision handling — upstream #2585.
+
+---
+
+## Resource length preflight without lazy allocation
+
+**Where:** `sdk/src/resource_store.rs`, `manifest.rs`, `ingredient.rs`.
+
+**What:** `ResourceStore::resource_len` inspects resident bytes, confined file
+metadata, or borrowed lazy assertion/databox slices without copying payloads.
+Databox URI lookup reuses the stored hashed reference (rather than inventing an
+empty hash that cannot pass existing databox matching). Hash comparison itself is
+unchanged. Resolver precedence matches retrieval, including recognized unsupported flattened
+manifest references. Inline tests prove length queries do not invoke retrieval.
+
+**Why:** Portable viewers must omit oversized embedded previews before triggering
+lazy materialization. Existing stream writes retrieve a Vec before calling the
+output writer; a bounded output writer alone cannot enforce that allocation cap.
+No store parsing, signature/trust semantics, or original-media limits change.
+
+---
+
+## Current per-claim validation sideband
+
+**Where:** `sdk/src/manifest.rs`.
+
+**What:** Reader manifests serialize `validation_status` failures from the
+current StatusTracker, attributed by claim URI/label before delta de-duplication.
+A present empty list means current signature validation observed no failures;
+an absent field means no current signature validation/failure was observed.
+This computed sideband is ignored when deserializing Manifest JSON.
+
+**Why:** Historical ingredient reports can contain old issuer trust outcomes,
+while aggregate reader errors omit unchanged ancestor outcomes. Preview source
+context needs the current containing claim's failures/untrusted state without
+reinterpreting old reports or changing SDK verification/trust decisions.

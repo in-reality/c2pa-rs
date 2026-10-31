@@ -11,7 +11,7 @@
 // specific language governing permissions and limitations under
 // each license.
 
-use std::{borrow::Cow, slice::Iter, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, slice::Iter, sync::Arc};
 
 use async_generic::async_generic;
 use log::debug;
@@ -36,14 +36,25 @@ use crate::{
     },
     manifest_assertion::ManifestAssertion,
     resource_store::{ResourceRef, ResourceStore, StoreResolver},
-    status_tracker::StatusTracker,
+    status_tracker::{LogKind, StatusTracker},
     store::Store,
+    validation_status::ValidationStatus,
     ClaimGeneratorInfo, Context, ManifestAssertionKind,
 };
+
+#[derive(Debug, Default)]
+pub(crate) struct ClaimValidationProjection {
+    checked: bool,
+    failures: Vec<ValidationStatus>,
+}
 
 /// This is used internally when generating manifests from a Store
 #[derive(Debug, Default)]
 pub(crate) struct StoreOptions {
+    // Consume each log item once while manifests are built, including any new
+    // identity-assertion checks. Avoid rescanning the full log for every claim.
+    pub(crate) validation_cursor: usize,
+    pub(crate) validation_by_manifest: HashMap<String, ClaimValidationProjection>,
     /// List of assertions that were listed and not found
     pub(crate) missing_assertions: Vec<String>,
     /// List of all assertions declared as redacted
@@ -140,6 +151,11 @@ pub struct Manifest {
     /// container for binary assets (like thumbnails)
     #[serde(skip)]
     resources: ResourceStore,
+
+    /// Fresh failures attributed to this claim by the current read. Historical
+    /// ingredient reports can differ from the caller's current trust context.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    validation_status: Option<Vec<ValidationStatus>>,
 }
 
 fn default_instance_id() -> String {
@@ -389,11 +405,7 @@ struct ManifestStoreResolver {
 impl StoreResolver for ManifestStoreResolver {
     fn get(&self, uri: &str) -> Option<crate::Result<Vec<u8>>> {
         if uri.contains(DATABOXES) {
-            let label = manifest_label_from_uri(uri)?;
-            let hashed_uri = HashedUri::new(uri.to_owned(), None, &[]);
-            return self
-                .store
-                .get_data_box_from_uri_and_claim(&hashed_uri, &label)
+            return crate::resource_store::data_box_by_uri(&self.store, uri)
                 .map(|db| Ok(db.data.clone()));
         }
         if uri.contains(ASSERTIONS) {
@@ -406,6 +418,20 @@ impl StoreResolver for ManifestStoreResolver {
         None
     }
 
+    fn len(&self, uri: &str) -> Option<crate::Result<u64>> {
+        if uri.contains(DATABOXES) {
+            return crate::resource_store::data_box_by_uri(&self.store, uri)
+                .map(|db| Ok(db.data.len() as u64));
+        }
+        if uri.contains(ASSERTIONS) {
+            return self
+                .store
+                .get_assertion_from_uri(uri)
+                .map(|assertion| Ok(assertion.data().len() as u64));
+        }
+        None
+    }
+
     fn has(&self, uri: &str) -> bool {
         if uri.contains(ASSERTIONS) {
             self.store
@@ -413,11 +439,7 @@ impl StoreResolver for ManifestStoreResolver {
                 .map(|a| matches!(a.decode_data(), AssertionData::Binary(_)))
                 .unwrap_or(false)
         } else if uri.contains(DATABOXES) {
-            let hr = HashedUri::new(uri.to_owned(), None, &[]);
-            let label = manifest_label_from_uri(uri).unwrap_or_default();
-            self.store
-                .get_data_box_from_uri_and_claim(&hr, &label)
-                .is_some()
+            crate::resource_store::data_box_by_uri(&self.store, uri).is_some()
         } else {
             false
         }
@@ -706,6 +728,35 @@ impl Manifest {
             }),
             None => None,
         };
+
+        let log = validation_log.logged_items();
+        for item in log.iter().skip(options.validation_cursor) {
+            let Some(status) = ValidationStatus::from_log_item(item) else {
+                continue;
+            };
+            let Some(label) = status.url().and_then(|url| {
+                manifest_label_from_uri(url)
+                    .or_else(|| store.get_claim(url).map(|_| url.to_owned()))
+            }) else {
+                continue;
+            };
+            let projection = options.validation_by_manifest.entry(label).or_default();
+            if status.code() == "claimSignature.validated" {
+                projection.checked = true;
+            }
+            if status.kind() == &LogKind::Failure {
+                projection.checked = true;
+                projection.failures.push(status);
+            }
+        }
+        options.validation_cursor = log.len();
+        // Some([]) is an authoritative current clean result; None means no
+        // attributable current signature validation/failure was observed.
+        if let Some(projection) = options.validation_by_manifest.get(manifest_label) {
+            if projection.checked {
+                manifest.validation_status = Some(projection.failures.clone());
+            }
+        }
 
         Ok(manifest)
     }
