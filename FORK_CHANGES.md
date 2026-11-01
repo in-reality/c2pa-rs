@@ -58,6 +58,35 @@ stream before `sign_file`.
 
 ---
 
+## Experimental BMFF v3 variable mdat leaf rows (t2075)
+
+**Where:** `sdk/src/builder.rs`, `sdk/src/assertions/bmff_hash.rs`,
+`sdk/tests/bmff_gop_leaves.rs`.
+
+**What:** `Builder::set_bmff_mdat_variable_hashes` delegates to
+`BmffHash::add_mdat_variable_leaf_hashes` to serialize complete ordered
+SHA-256 leaf rows and positive, checked `variableBlockSizes`. Counts, sizes,
+row lengths and physical mdat indices are checked by the real stream verifier;
+variable maps without auxiliary proofs require the full leaf row. Per-mdat
+range lookup uses physical indices rather than unordered map iteration.
+Tree/digest algorithms are unchanged. One/odd/even rows, individual leaf
+tampering and malformed serialized maps have focused regression coverage.
+
+**Why:** The isolated Android/common capture experiment needs exact full-payload
+GOP byte ranges without pre-sign remuxing. Roots are computed separately, never
+serialized as a nonstandard field or substituted for a multi-leaf row.
+
+**Limits:** The pinned Merkle range implementation still starts at box+16,
+which differs from C2PA's actual-payload rule for 8-byte mdat headers; the
+capture experiment explicitly rejects those headers. This offset must not be
+explained by the distinct offset-16 flat-hash exclusion. The existing fixed
+injector/root-only verifier remains available unchanged; preserving it is not
+independent proof that its root-only/no-auxiliary-proof representation complies
+with the C2PA standard. No platform qualification, production activation or
+manifest-lane integration is implied by this isolated change.
+
+---
+
 ## Builder: dynamic assertion finalization in sign_embeddable
 
 **What:** Finalize dynamic assertions before `sign_manifest` in
