@@ -127,3 +127,28 @@ This computed sideband is ignored when deserializing Manifest JSON.
 while aggregate reader errors omit unchanged ancestor outcomes. Preview source
 context needs the current containing claim's failures/untrusted state without
 reinterpreting old reports or changing SDK verification/trust decisions.
+
+---
+
+## Ingredient: credential-only verification with unverified media binding
+
+**Where:** `sdk/src/ingredient.rs`.
+
+**What:** Additive `with_manifest_data_unverified_binding` uses the normal store
+verifier without an asset, never reading media/XMP/container trees. It returns
+genuine credential-only signature/trust results separately and retains observed
+failures/informational results in the same ingredient. Its signed partial record
+omits successes and explicitly describes source-media binding as not performed,
+so the SDK aggregate cannot promote an unverified source to valid/trusted. The
+existing three-state SDK calls that incomplete record `Invalid`; this is not a
+claim of observed media invalidity. Callers must distinguish the explicit unknown
+binding from actual recorded failures. Original manifests/resources stay intact;
+thumbnail references require a genuinely verified assertion hash. No arbitrary
+validation-result setter or source-binding success is introduced. Existing normal
+media import remains unchanged, with a shared thumbnail-reference helper.
+
+**Why:** Bounded source validation may be unavailable while credential signatures
+still contain actionable negatives. Disabling all verification loses those
+records and can turn a previously advisory negative into a new mint-gate refusal.
+The credential-only seam retains real evidence without expensive media parsing,
+false store-as-media binding failures, or weakening the existing output gate.

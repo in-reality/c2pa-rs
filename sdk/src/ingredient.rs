@@ -653,6 +653,129 @@ impl Ingredient {
         ingredient
     }
 
+    fn claim_thumbnail_ref(claim: &Claim) -> Option<ResourceRef> {
+        let hashed_uri = claim
+            .assertions()
+            .iter()
+            .find(|uri| uri.url().contains(labels::CLAIM_THUMBNAIL))?;
+        let manifest =
+            manifest_label_from_uri(&hashed_uri.url()).unwrap_or_else(|| claim.label().to_string());
+        let uri = jumbf::labels::to_absolute_uri(&manifest, &hashed_uri.url());
+        let format = hashed_uri
+            .url()
+            .rsplit_once('.')
+            .and_then(|(_, ext)| extension_to_mime(ext))
+            .unwrap_or("image/jpeg");
+        let mut thumb = ResourceRef::new(format, &uri);
+        thumb.alg = hashed_uri.alg();
+        thumb.hash = Some(base64::encode(&hashed_uri.hash()));
+        Some(thumb)
+    }
+
+    /// Verify the attached credential store without validating its source-media binding.
+    ///
+    /// This never reads source media, XMP, or a media-container tree. The caller
+    /// must already own and identify the exact source separately, and must first
+    /// attach its governing store with [`Self::set_manifest_data`]. An absent
+    /// store represents a source with no declared credentials and creates none.
+    /// Normal source validation should continue to use [`Self::with_stream`].
+    ///
+    /// Returns the same ingredient and the genuine credential-only report.
+    /// That report may contain real signature/trust successes; it is not evidence
+    /// that source media matches the credential binding. The ingredient's signed
+    /// partial report keeps observed failures/informational findings but omits
+    /// successes, so its aggregate state cannot claim full validity/trust. Its
+    /// description explicitly marks media binding as not performed. No status is
+    /// manufactured, and imported ancestor reports/resources are unchanged.
+    ///
+    /// An inherited thumbnail is linked only after its assertion hash was
+    /// verified. Callers still own bounded image decoding and optional-preview
+    /// policy. Malformed stores and operational/cancellation failures remain errors.
+    #[async_generic]
+    pub fn with_manifest_data_unverified_binding(
+        mut self,
+        context: &Context,
+    ) -> Result<(Self, ValidationResults)> {
+        use crate::validation_results::{IngredientDeltaValidationResult, StatusCodes};
+        let declared = self.manifest_data.is_some();
+        let data = self.manifest_data().map(|bytes| bytes.into_owned());
+        if declared && data.is_none() {
+            return Err(Error::ResourceNotFound("declared manifest data".into()));
+        }
+        self.validation_results = None;
+        self.validation_status = None;
+        self.active_manifest = None;
+        let Some(data) = data else {
+            self.set_description("Source media binding validation was not performed; no credential store was declared.");
+            return Ok((self, ValidationResults::default()));
+        };
+        self.set_description("Source media binding validation was not performed; only the attached credential store was inspected. Credential-only findings do not establish source-media validity.");
+        let mut log = StatusTracker::default();
+        let store = Store::from_jumbf_with_context(&data, &mut log, context)?;
+        let verified = if _sync {
+            Store::verify_store(&store, None, &mut log, context)
+        } else {
+            Store::verify_store_async(&store, None, &mut log, context).await
+        };
+        let report = ValidationResults::from_store(&store, &log);
+        // Validation errors that the SDK actually recorded belong to the
+        // ingredient. A cancellation/operational error with no finding must
+        // still propagate rather than becoming an apparently empty report.
+        let has_failure = report
+            .active_manifest()
+            .is_some_and(|m| !m.failure().is_empty())
+            || report.ingredient_deltas().is_some_and(|d| {
+                d.iter()
+                    .any(|d| !d.validation_deltas().failure().is_empty())
+            });
+        if let Err(error) = verified {
+            if matches!(
+                error,
+                Error::OperationCancelled | Error::IoError(_) | Error::RemoteManifestFetch(_)
+            ) || !has_failure
+            {
+                return Err(error);
+            }
+        }
+        let claim = store.provenance_claim().ok_or(Error::ProvenanceMissing)?;
+        self.active_manifest = Some(claim.label().to_string());
+        if self.thumbnail.is_none() {
+            if let Some(thumb) = Self::claim_thumbnail_ref(claim) {
+                let verified_hash = report.active_manifest().is_some_and(|m| {
+                    m.success().iter().any(|status| {
+                        status.code() == validation_status::ASSERTION_HASHEDURI_MATCH
+                            && status.url() == Some(thumb.identifier.as_str())
+                    })
+                });
+                if verified_hash {
+                    self.set_thumbnail_ref(thumb)?;
+                }
+            }
+        }
+        let negative_only = |codes: &StatusCodes| {
+            let mut partial = StatusCodes::default();
+            for status in codes.informational().iter().chain(codes.failure()) {
+                partial.add_status(status.clone());
+            }
+            partial
+        };
+        let mut partial = ValidationResults::default();
+        if let Some(active) = report.active_manifest() {
+            partial = partial.add_active_manifest(negative_only(active));
+        }
+        if let Some(deltas) = report.ingredient_deltas() {
+            for delta in deltas {
+                partial = partial.add_ingredient_delta(IngredientDeltaValidationResult::new(
+                    delta.ingredient_assertion_uri(),
+                    negative_only(delta.validation_deltas()),
+                ));
+            }
+        }
+        self.validation_status = partial.validation_errors();
+        self.validation_results = Some(partial);
+        Ok((self, report))
+    }
+
     // Utility method to set the validation status from store result and log
     // Also sets the thumbnail from the claim if valid and it exists
     fn update_validation_status(
@@ -674,27 +797,7 @@ impl Ingredient {
                             .active_manifest()
                             .is_some_and(|m| m.failure().is_empty())
                     {
-                        if let Some(hashed_uri) = claim
-                            .assertions()
-                            .iter()
-                            .find(|hashed_uri| hashed_uri.url().contains(labels::CLAIM_THUMBNAIL))
-                        {
-                            // We found a valid claim thumbnail so just reference it, we don't need to copy it
-                            let thumb_manifest = manifest_label_from_uri(&hashed_uri.url())
-                                .unwrap_or_else(|| claim.label().to_string());
-                            let uri =
-                                jumbf::labels::to_absolute_uri(&thumb_manifest, &hashed_uri.url());
-                            // Try to determine the format from the assertion label in the URL
-                            let format = hashed_uri
-                                .url()
-                                .rsplit_once('.')
-                                .and_then(|(_, ext)| extension_to_mime(ext))
-                                .unwrap_or("image/jpeg"); // default to jpeg??
-                            let mut thumb = ResourceRef::new(format, &uri);
-                            // keep track of the alg and hash for reuse
-                            thumb.alg = hashed_uri.alg();
-                            let hash = base64::encode(&hashed_uri.hash());
-                            thumb.hash = Some(hash);
+                        if let Some(thumb) = Self::claim_thumbnail_ref(claim) {
                             self.set_thumbnail_ref(thumb)?;
                         }
                     }
@@ -1694,6 +1797,262 @@ mod tests {
         let (format, mut ingredient, _) = create_test_streams(name);
         let json = format!("{{\"title\": \"{name}\"}}");
         Ingredient::from_json(&json)?.with_stream(format, &mut ingredient, context)
+    }
+
+    fn credential_only_fixture() -> Vec<u8> {
+        let (_, mut input, _) = create_test_streams("earth_apollo17.jpg");
+        let preview = include_bytes!("../tests/fixtures/earth_apollo17.jpg");
+        let context = Context::new().with_settings(serde_json::json!({"verify":{"verify_after_sign":false},"builder":{"thumbnail":{"enabled":false}}})).unwrap();
+        let mut builder = Builder::from_context(context).with_definition(serde_json::json!({"title":"Credential-only original", "claim_generator_info":[{"name":"Credential-only fixture"}]})).unwrap();
+        builder.set_intent(BuilderIntent::Create(DigitalSourceType::DigitalCapture));
+        builder
+            .set_thumbnail("image/jpeg", &mut Cursor::new(preview))
+            .unwrap();
+        let signer = test_signer(SigningAlg::Es256);
+        builder
+            .sign(
+                signer.as_ref(),
+                "image/jpeg",
+                &mut input,
+                &mut Cursor::new(Vec::new()),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_unverified_binding_retains_real_credential_report_and_resource_hash() {
+        use crate::{context::ProgressPhase, status_tracker::LogKind};
+        let data = credential_only_fixture();
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = phases.clone();
+        // SDK unit-test defaults include fixture roots; isolate this trust case.
+        let context = Context::new().with_settings(serde_json::json!({"trust":{"user_anchors":null,"trust_anchors":null,"trust_config":null,"allowed_list":null}})).unwrap().with_progress_callback(move |phase, _, _| {
+            assert_ne!(phase, ProgressPhase::VerifyingAssetHash);
+            observed.lock().unwrap().push(phase);
+            true
+        });
+        let mut parent = Ingredient::new_v2("Actual source", "image/jpeg");
+        parent.set_instance_id("xmp:iid:exact-source");
+        parent.set_is_parent();
+        parent.set_manifest_data(data.clone()).unwrap();
+        let (parent, report) = parent
+            .with_manifest_data_unverified_binding(&context)
+            .unwrap();
+        let report = report.active_manifest().unwrap();
+        assert!(report
+            .success()
+            .iter()
+            .any(|s| s.code() == validation_status::CLAIM_SIGNATURE_VALIDATED));
+        // Store's cfg(test) trust policy also embeds these fixture roots,
+        // independently of Context settings. Production-context untrusted
+        // behavior is covered by the backend's fresh ephemeral certificate.
+        assert!(report
+            .success()
+            .iter()
+            .any(|s| s.code() == validation_status::SIGNING_CREDENTIAL_TRUSTED));
+        assert!(!report
+            .success()
+            .iter()
+            .any(|s| s.code() == validation_status::ASSERTION_DATAHASH_MATCH));
+        let partial = parent.validation_results().unwrap();
+        assert_eq!(partial.validation_state(), ValidationState::Invalid);
+        assert!(partial.active_manifest().unwrap().success().is_empty());
+        assert!(partial
+            .active_manifest()
+            .unwrap()
+            .failure()
+            .iter()
+            .all(|s| s.kind() == &LogKind::Failure));
+        assert!(parent
+            .description()
+            .unwrap()
+            .contains("binding validation was not performed"));
+        assert_eq!(parent.instance_id(), "xmp:iid:exact-source");
+        assert_eq!(parent.format(), Some("image/jpeg"));
+        assert_eq!(parent.manifest_data().unwrap().as_ref(), data.as_slice());
+        assert!(parent.thumbnail_ref().is_some());
+        assert!(phases
+            .lock()
+            .unwrap()
+            .contains(&ProgressPhase::VerifyingSignature));
+        let serialized = serde_json::to_value(&parent).unwrap();
+        assert!(
+            serialized["validation_results"]["activeManifest"]["success"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(serialized["description"]
+            .as_str()
+            .unwrap()
+            .contains("not performed"));
+    }
+
+    #[test]
+    fn test_unverified_binding_keeps_bad_signature_without_claiming_source_validity() {
+        let mut data = credential_only_fixture();
+        let name = b"Credential-only fixture";
+        let position = data
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap();
+        data[position] = b'X';
+        let mut parent = Ingredient::new_v2("Actual source", "video/mp4");
+        parent.set_manifest_data(data.clone()).unwrap();
+        let (parent, report) = parent
+            .with_manifest_data_unverified_binding(&Context::new())
+            .unwrap();
+        for results in [parent.validation_results().unwrap(), &report] {
+            assert!(results
+                .active_manifest()
+                .unwrap()
+                .failure()
+                .iter()
+                .any(|s| s.code() == validation_status::CLAIM_SIGNATURE_MISMATCH));
+        }
+        assert_eq!(
+            parent.validation_results().unwrap().validation_state(),
+            ValidationState::Invalid
+        );
+        assert_eq!(parent.manifest_data().unwrap().as_ref(), data.as_slice());
+    }
+
+    #[test]
+    fn test_unverified_binding_trust_report_is_separate_from_media_validity() {
+        let mut parent = Ingredient::new_v2("Actual source", "video/mp4");
+        parent.set_manifest_data(credential_only_fixture()).unwrap();
+        let context=Context::new().with_settings(serde_json::json!({"trust":{"allowed_list":include_str!("../tests/fixtures/certs/es256.pub")}})).unwrap();
+        let (parent, report) = parent
+            .with_manifest_data_unverified_binding(&context)
+            .unwrap();
+        assert!(report
+            .active_manifest()
+            .unwrap()
+            .success()
+            .iter()
+            .any(|s| s.code() == validation_status::SIGNING_CREDENTIAL_TRUSTED));
+        assert_ne!(
+            parent.validation_results().unwrap().validation_state(),
+            ValidationState::Valid
+        );
+        assert_ne!(
+            parent.validation_results().unwrap().validation_state(),
+            ValidationState::Trusted
+        );
+        assert!(parent
+            .validation_results()
+            .unwrap()
+            .validation_errors()
+            .is_none());
+        // Exercise the signed assertion and Reader, not only the mutable input.
+        let (_, mut input, _) = create_test_streams("earth_apollo17.jpg");
+        let context = Context::new().with_settings(serde_json::json!({"verify":{"verify_after_sign":false},"builder":{"thumbnail":{"enabled":false}}})).unwrap();
+        let mut builder = Builder::from_context(context)
+            .with_definition(serde_json::json!({"title":"Partial input consumer"}))
+            .unwrap();
+        builder.set_intent(BuilderIntent::Edit);
+        let mut parent = parent;
+        parent.set_is_parent();
+        builder.add_ingredient(parent);
+        let mut output = Cursor::new(Vec::new());
+        builder
+            .sign(
+                test_signer(SigningAlg::Es256).as_ref(),
+                "image/jpeg",
+                &mut input,
+                &mut output,
+            )
+            .unwrap();
+        let reader = Reader::from_context(Context::new())
+            .with_stream("image/jpeg", Cursor::new(output.into_inner()))
+            .unwrap();
+        let parent = &reader.active_manifest().unwrap().ingredients()[0];
+        assert!(parent.description().unwrap().contains("not performed"));
+        assert_eq!(
+            parent.validation_results().unwrap().validation_state(),
+            ValidationState::Invalid
+        );
+        assert!(
+            parent
+                .validation_results()
+                .unwrap()
+                .validation_errors()
+                .is_none(),
+            "incomplete is not a manufactured corruption finding"
+        );
+        let value: serde_json::Value = serde_json::from_str(&reader.json()).unwrap();
+        let active = value["active_manifest"].as_str().unwrap();
+        assert!(value["manifests"][active]["ingredients"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not performed"));
+        assert!(reader
+            .validation_status()
+            .unwrap_or(&[])
+            .iter()
+            .all(
+                |s| s.code() != validation_status::ASSERTION_DATAHASH_MISMATCH
+                    && s.code() != validation_status::CLAIM_SIGNATURE_MISMATCH
+            ));
+        if let Ok(directory) = std::env::var("T2061_SDK_PARTIAL_EVIDENCE") {
+            use std::io::Write;
+            for (name, bytes) in [
+                (
+                    "credential-report.json",
+                    serde_json::to_vec_pretty(&report).unwrap(),
+                ),
+                (
+                    "final-reader.json",
+                    serde_json::to_vec_pretty(&value).unwrap(),
+                ),
+                (
+                    "final-ingredient.json",
+                    serde_json::to_vec_pretty(parent).unwrap(),
+                ),
+            ] {
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(std::path::Path::new(&directory).join(name))
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_unverified_binding_absent_malformed_and_cancelled_stores_are_distinct() {
+        let (parent, report) = Ingredient::new_v2("Unsigned source", "video/mp4")
+            .with_manifest_data_unverified_binding(&Context::new())
+            .unwrap();
+        assert!(parent.active_manifest().is_none());
+        assert!(parent.manifest_data().is_none());
+        assert!(report.active_manifest().is_none());
+        let mut malformed = Ingredient::new_v2("Actual source", "video/mp4");
+        malformed
+            .set_manifest_data(b"malformed store".to_vec())
+            .unwrap();
+        assert!(malformed
+            .with_manifest_data_unverified_binding(&Context::new())
+            .is_err());
+        let mut missing = Ingredient::new_v2("Actual source", "video/mp4");
+        missing
+            .set_manifest_data_ref(ResourceRef::new("application/c2pa", "missing"))
+            .unwrap();
+        assert!(matches!(
+            missing.with_manifest_data_unverified_binding(&Context::new()),
+            Err(Error::ResourceNotFound(_))
+        ));
+        let mut cancelled = Ingredient::new_v2("Actual source", "video/mp4");
+        cancelled
+            .set_manifest_data(credential_only_fixture())
+            .unwrap();
+        let context = Context::new().with_progress_callback(|_, _, _| false);
+        assert!(matches!(
+            cancelled.with_manifest_data_unverified_binding(&context),
+            Err(Error::OperationCancelled)
+        ));
     }
 
     #[test]
