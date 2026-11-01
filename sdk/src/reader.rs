@@ -862,6 +862,25 @@ impl Reader {
     pub fn get_manifest(&self, label: &str) -> Option<&Manifest> {
         self.manifests.get(label)
     }
+    /// Returns the SDK manifest-box identity used by ingredient conflict resolution.
+    ///
+    /// This identifies one manifest independently of its surrounding store closure
+    /// and padding. It is not the whole-store content address, a source-media hash,
+    /// or proof of signature, trust, or media-binding validation. An unknown label
+    /// or unavailable identity is an error, never an empty successful identity.
+    pub fn manifest_box_hash(&self, label: &str) -> Result<Vec<u8>> {
+        let claim = self
+            .store
+            .get_claim(label)
+            .ok_or_else(|| Error::ResourceNotFound(label.to_owned()))?;
+        let identity = self.store.get_manifest_box_hashes(claim).manifest_box_hash;
+        if identity.is_empty() {
+            return Err(Error::OtherError(
+                "manifest box identity unavailable".into(),
+            ));
+        }
+        Ok(identity)
+    }
 
     /// Write a resource identified by URI to the given stream.
     /// Use this function, for example, to get a thumbnail or icon image and write it to a stream.
@@ -1351,6 +1370,52 @@ pub mod tests {
     const SAMPLE1_HEIC: &[u8] = include_bytes!("../tests/fixtures/sample1.heic");
 
     #[test]
+    fn manifest_box_identity_is_independent_of_surrounding_store_closure() -> Result<()> {
+        let reader = Reader::default()
+            .with_stream("image/jpeg", Cursor::new(IMAGE_WITH_INGREDIENT_MANIFEST))?;
+        let label = reader.active_manifest().unwrap().ingredients()[0]
+            .active_manifest()
+            .unwrap();
+        let mut flattened = Cursor::new(Vec::new());
+        reader.resource_to_stream(label, &mut flattened)?;
+        let standalone = Reader::default()
+            .with_stream("application/c2pa", Cursor::new(flattened.into_inner()))?;
+        assert!(reader.manifests().len() > standalone.manifests().len());
+        assert_eq!(
+            reader.manifest_box_hash(label)?,
+            standalone.manifest_box_hash(label)?
+        );
+        assert!(reader.manifest_box_hash("missing-manifest").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_box_identity_ignores_outer_store_padding() -> Result<()> {
+        let reader =
+            Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_MANIFEST))?;
+        let mut store = crate::jumbf_io::load_jumbf_from_memory("image/jpeg", IMAGE_WITH_MANIFEST)?;
+        let original = store.clone();
+        let size = u32::from_be_bytes(store[..4].try_into().unwrap());
+        use crate::jumbf::boxes::{BMFFBox, JUMBFPaddingContentBox, JUMBFSuperBox};
+        // A permitted unknown outer superbox carries padding. Bare root `free`
+        // children are not accepted by the store parser and are not this case.
+        let mut padding = JUMBFSuperBox::new("padding", Some("00000000000000000000000000000000"));
+        padding.add_data_box(Box::new(JUMBFPaddingContentBox::new(8)));
+        let mut padding_bytes = Vec::new();
+        padding.write_box(&mut padding_bytes)?;
+        store.extend_from_slice(&padding_bytes);
+        store[..4].copy_from_slice(&(size + padding_bytes.len() as u32).to_be_bytes());
+        assert_ne!(store, original);
+        let padded = Reader::default().with_stream("application/c2pa", Cursor::new(store))?;
+        let label = reader.active_label().unwrap();
+        assert_eq!(
+            reader.manifest_box_hash(label)?,
+            padded.manifest_box_hash(label)?
+        );
+        Ok(())
+    }
+
+    #[test]
     // Verify that we can convert a Reader back into a Builder re-sign and the read it back again
     fn test_into_builder() -> Result<()> {
         let context = test_context().into_shared();
@@ -1408,7 +1473,12 @@ pub mod tests {
         let reader =
             Reader::default().with_stream("image/jpeg", Cursor::new(IMAGE_WITH_REMOTE_MANIFEST))?;
         let remote_url = reader.remote_url();
-        assert_eq!(remote_url, Some("https://cai-manifests.adobe.com/manifests/adobe-urn-uuid-5f37e182-3687-462e-a7fb-573462780391"));
+        assert_eq!(
+            remote_url,
+            Some(
+                "https://cai-manifests.adobe.com/manifests/adobe-urn-uuid-5f37e182-3687-462e-a7fb-573462780391"
+            )
+        );
         assert!(!reader.is_embedded());
 
         Ok(())

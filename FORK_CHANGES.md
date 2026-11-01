@@ -152,3 +152,18 @@ still contain actionable negatives. Disabling all verification loses those
 records and can turn a previously advisory negative into a new mint-gate refusal.
 The credential-only seam retains real evidence without expensive media parsing,
 false store-as-media binding failures, or weakening the existing output gate.
+
+---
+
+## Reader: manifest-box conflict identity
+
+**Where:** `sdk/src/reader.rs`.
+
+**What:** Additive `Reader::manifest_box_hash(label)` exposes the existing SDK
+manifest-box identity used by ingredient conflict resolution. The method rejects
+missing labels/unavailable hashes and adds no validation success or trust claim.
+
+**Why:** A media-backed ingredient may receive a governing store separately from
+its embedded store. Callers need to recognize an actual same-label claim conflict
+without rejecting equivalent governing claims for different surrounding closure
+or store padding, or reimplementing SDK identity semantics.
