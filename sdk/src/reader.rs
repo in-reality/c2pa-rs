@@ -103,6 +103,10 @@ pub struct Reader {
     /// ValidationStatus generated when loading the ManifestStore from an asset
     validation_results: Option<ValidationResults>,
 
+    /// Current read checks before historical ingredient-result de-duplication.
+    #[serde(skip)]
+    current_validation_status: Option<Vec<ValidationStatus>>,
+
     /// The validation state of the manifest store
     validation_state: Option<ValidationState>,
 
@@ -126,6 +130,7 @@ impl Default for Reader {
             manifests: HashMap::new(),
             validation_status: None,
             validation_results: None,
+            current_validation_status: None,
             validation_state: None,
             store: Arc::new(Store::new()),
             assertion_values: HashMap::new(),
@@ -799,6 +804,16 @@ impl Reader {
         self.validation_results.as_ref()
     }
 
+    /// Current SDK checks from this read, without historical ingredient de-duplication.
+    ///
+    /// Each status retains its log kind and ingredient scope. Historical signed
+    /// validation reports are not copied here. `None` means read-time validation
+    /// was not enabled (or this Reader was deserialized); an empty list does not
+    /// establish signature, signer trust, or subject-byte binding.
+    pub fn current_validation_status(&self) -> Option<&[ValidationStatus]> {
+        self.current_validation_status.as_deref()
+    }
+
     /// Get the [`ValidationState`] of the manifest store.
     pub fn validation_state(&self) -> ValidationState {
         if let Some(validation_results) = self.validation_results() {
@@ -1098,6 +1113,18 @@ impl Reader {
 
         self.active_manifest = active_manifest;
         self.manifests = manifests;
+        self.current_validation_status =
+            self.context
+                .settings()
+                .verify
+                .verify_after_reading
+                .then(|| {
+                    validation_log
+                        .logged_items()
+                        .iter()
+                        .filter_map(ValidationStatus::from_log_item)
+                        .collect()
+                });
         self.validation_status = validation_results.validation_errors();
         self.validation_results = Some(validation_results);
         self.validation_state = Some(validation_state);
@@ -1124,6 +1151,9 @@ impl Reader {
             assertion_values.extend(values);
             for log in validation_log.logged_items() {
                 if let Some(status) = ValidationStatus::from_log_item(log) {
+                    if let Some(current) = self.current_validation_status.as_mut() {
+                        current.push(status.clone());
+                    }
                     validation_results.add_status(status);
                 } else {
                     eprintln!("Failed to create status from log item: {log:?}");
