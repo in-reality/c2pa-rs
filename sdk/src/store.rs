@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Read, Seek, SeekFrom},
+    sync::Arc,
 };
 
 use async_generic::async_generic;
@@ -86,6 +87,26 @@ use crate::{
     AsyncSigner, Signer, ValidationResults, ValidationState,
 };
 
+// Opt-in complete-store decoded-byte preflight. Counts output only; never
+// allocates a decoded Vec. Brotli's own bounded working memory is not this quota.
+struct DecodedManifestCounter {
+    limit: usize,
+    bytes: usize,
+    exceeded: bool,
+}
+impl std::io::Write for DecodedManifestCounter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.checked_add(data.len());
+        if next.is_none_or(|n| n > self.limit) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "decoded store budget"));
+        }
+        self.bytes = next.unwrap();
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 const MANIFEST_STORE_EXT: &str = "c2pa"; // file extension for external manifests
 #[cfg(feature = "fetch_remote_manifests")]
 const DEFAULT_MANIFEST_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
@@ -133,6 +154,72 @@ pub struct Store {
     ctp: CertificateTrustPolicy,
     remote_url: Option<String>,
     embedded: bool,
+}
+
+// Imported manifests own exact boxes. A no-header wrapper lets Cai retain the
+// original framing, descriptor, compression and resource bytes verbatim.
+#[derive(Debug)]
+struct PreservedManifestBox(Arc<[u8]>);
+impl BMFFBox for PreservedManifestBox {
+    fn box_type(&self) -> &'static [u8; 4] {
+        b"    "
+    }
+    fn box_uuid(&self) -> &'static str {
+        JUMB_FOURCC
+    }
+    fn box_payload_size(&self) -> std::io::Result<u32> {
+        u32::try_from(self.0.len()).map_err(|_| std::io::Error::other("manifest size"))
+    }
+    fn write_box_payload(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writer.write_all(&self.0)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// Read only framing here. SDK parsing/validation still determines supported
+// contents; ranges retain the original bytes rather than reserializing them.
+fn raw_box_range(bytes: &[u8], at: usize) -> Result<(usize, usize)> {
+    let header = bytes
+        .get(at..at.checked_add(8).ok_or(Error::JumbfCreationError)?)
+        .ok_or(Error::JumbfCreationError)?;
+    let short = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let (size, header_len) = match short {
+        0 => (bytes.len() - at, 8),
+        1 => {
+            let long = bytes
+                .get(at + 8..at + 16)
+                .ok_or(Error::JumbfCreationError)?;
+            (
+                usize::try_from(u64::from_be_bytes(long.try_into().unwrap()))
+                    .map_err(|_| Error::JumbfCreationError)?,
+                16,
+            )
+        }
+        n => (n as usize, 8),
+    };
+    if size < header_len {
+        return Err(Error::JumbfCreationError);
+    }
+    let end = at
+        .checked_add(size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(Error::JumbfCreationError)?;
+    Ok((end, header_len))
+}
+
+fn raw_manifest_boxes(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let (end, header) = raw_box_range(bytes, 0)?;
+    let store = &bytes[..end];
+    let (mut at, _) = raw_box_range(store, header)?; // skip store description
+    let mut boxes = Vec::new();
+    while at < store.len() {
+        let (next, _) = raw_box_range(store, at)?;
+        boxes.push(&store[at..next]);
+        at = next;
+    }
+    Ok(boxes)
 }
 
 struct ManifestInfo<'a> {
@@ -263,7 +350,7 @@ impl Store {
             ManifestHashes {
                 manifest_box_hash: Store::calc_manifest_box_hash(claim, None, claim.alg())
                     .unwrap_or_default(),
-                signature_box_hash: Claim::calc_sig_box_hash(claim, claim.alg())
+                signature_box_hash: Store::calc_signature_box_hash(claim, claim.alg())
                     .unwrap_or_default(),
             }
         }
@@ -419,6 +506,9 @@ impl Store {
     /// Get Claim by label
     // Returns Option<&Claim>
     pub fn get_claim_mut(&mut self, label: &str) -> Option<&mut Claim> {
+        // A caller may change signed bytes; loaded hash-cache entries must not
+        // survive a mutable borrow, even when the prior raw box is retained.
+        self.manifest_box_hash_cache.remove(label);
         self.claims_map.get_mut(label)
     }
 
@@ -769,7 +859,32 @@ impl Store {
             Ok(())
         }
 
+        // A complete source import retains inactive history. Requests for an
+        // older non-governing ingredient still resolve only that ancestry.
+        if store
+            .provenance_claim()
+            .is_some_and(|active| active.label() == claim.label())
+        {
+            for inactive in store.claims() {
+                if inactive.label() != claim.label() {
+                    collect_flat(
+                        store,
+                        inactive,
+                        &mut ingredient_store,
+                        &mut visited,
+                        &mut path,
+                    )?;
+                }
+            }
+        }
         collect_flat(store, claim, &mut ingredient_store, &mut visited, &mut path)?;
+        // An inactive claim may reference the governing claim. Preserve its
+        // identity but ensure the requested governing claim is last/active.
+        ingredient_store
+            .claims
+            .retain(|label| label != claim.label());
+        ingredient_store.claims.push(claim.label().to_owned());
+        ingredient_store.set_provenance_path(claim);
 
         Ok(ingredient_store)
     }
@@ -1030,9 +1145,13 @@ impl Store {
         // Add claims and assertions in this store to the JUMBF store.
         for claim in self.claims() {
             let cai_store = Store::build_manifest_box(claim, min_reserve_size)?;
-
-            // add the completed CAI store into the CAI block.
-            cai_block.add_box(Box::new(cai_store));
+            let mut normalized = Vec::new();
+            cai_store.write_box(&mut normalized)?;
+            if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+                cai_block.add_box(Box::new(PreservedManifestBox(raw)));
+            } else {
+                cai_block.add_box(Box::new(cai_store));
+            }
         }
 
         // Write it to memory.
@@ -1153,6 +1272,42 @@ impl Store {
         Ok(cai_store)
     }
 
+    // Ingredient_v3 claimSignature hashes cover the actual signature superbox
+    // payload, including optional descriptor bytes. Reuse raw bytes only when
+    // the complete claim still matches the preserved serialization fingerprint.
+    fn calc_signature_box_hash(claim: &Claim, alg: &str) -> Result<Vec<u8>> {
+        let mut normalized = Vec::new();
+        Store::build_manifest_box(claim, 0)?.write_box(&mut normalized)?;
+        if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+            let (end, mut at) = raw_box_range(&raw, 0)?;
+            let mut payload = None;
+            while at < end {
+                let (next, header) = raw_box_range(&raw, at)?;
+                if &raw[at + 4..at + 8] == b"jumb" {
+                    let child = &raw[at..next];
+                    let (desc_end, desc_header) = raw_box_range(child, header)?;
+                    if &child[header + 4..header + 8] != b"jumd" {
+                        return Err(Error::JumbfCreationError);
+                    }
+                    let uuid = child
+                        .get(header + desc_header..header + desc_header + 16)
+                        .filter(|_| desc_end >= header + desc_header + 16)
+                        .ok_or(Error::JumbfCreationError)?;
+                    if hex::encode_upper(uuid) == CAI_SIGNATURE_UUID {
+                        if payload.is_some() {
+                            return Err(Error::JumbfCreationError);
+                        }
+                        payload = Some(at + header..next);
+                    }
+                }
+                at = next;
+            }
+            let payload = payload.ok_or(Error::JumbfCreationError)?;
+            return Ok(hash_by_alg(alg, &raw[payload], None));
+        }
+        Claim::calc_sig_box_hash(claim, alg)
+    }
+
     // calculate the hash of the manifest JUMBF box
     pub fn calc_manifest_box_hash(
         claim: &Claim,
@@ -1165,13 +1320,20 @@ impl Store {
         let mut cai_store = Store::build_manifest_box(claim, 0)?;
 
         // add salt if requested
-        if let Some(salt) = salt {
-            cai_store.set_salt(salt)?;
+        if let Some(ref salt) = salt {
+            cai_store.set_salt(salt.clone())?;
         }
 
-        // box content as Vec
+        let mut normalized = Vec::new();
+        cai_store.write_box(&mut normalized)?;
+        // Explicit salting asks for a modified box; never reuse an unsalted raw one.
+        if salt.is_none() {
+            if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+                let (_, header) = raw_box_range(&raw, 0)?;
+                return Ok(hash_by_alg(alg, &raw[header..], None));
+            }
+        }
         cai_store.super_box().write_box_payload(&mut hash_bytes)?;
-
         Ok(hash_by_alg(alg, &hash_bytes, None))
     }
 
@@ -1206,7 +1368,10 @@ impl Store {
             .core
             .max_decompressed_manifest_size_in_mb
             .saturating_mul(1024 * 1024);
-        Self::from_jumbf_impl(Store::new(), buffer, validation_log, max_manifest_size)
+        let max_store_size = get_thread_local_settings()
+            .core.max_decompressed_store_size_in_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024));
+        Self::from_jumbf_impl(Store::new(), buffer, validation_log, max_manifest_size, max_store_size)
     }
 
     #[inline]
@@ -1225,6 +1390,8 @@ impl Store {
             buffer,
             validation_log,
             max_manifest_size,
+            context.settings().core.max_decompressed_store_size_in_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024)),
         )
     }
 
@@ -1233,6 +1400,7 @@ impl Store {
         buffer: &[u8],
         validation_log: &mut StatusTracker,
         max_manifest_size: usize,
+        max_store_size: Option<usize>,
     ) -> Result<Store> {
         if buffer.is_empty() {
             return Err(Error::JumbfNotFound);
@@ -1259,12 +1427,42 @@ impl Store {
         }
 
         let num_stores = cai_block.data_box_count();
+        let raw_manifests = raw_manifest_boxes(buffer)?;
+        if raw_manifests.len() != num_stores {
+            return Err(Error::JumbfCreationError);
+        }
+        // Inspect EVERY raw manifest, including inactive/unreachable/ignored
+        // UUIDs, before any CAIManifest decoded Vec/Claim/assertion allocation.
+        let decoded_sizes = if let Some(mut remaining) = max_store_size {
+            let mut sizes = Vec::with_capacity(num_stores);
+            for idx in 0..num_stores {
+                let raw_box = cai_block.data_box_as_superbox(idx)
+                    .ok_or(Error::JumbfBoxNotFound)?;
+                let size = if let Some(compressed) = raw_box.data_box_as_brotli_box(0) {
+                    let mut counter = DecodedManifestCounter {
+                        limit: remaining.min(max_manifest_size), bytes: 0, exceeded: false,
+                    };
+                    let decoded = brotli::BrotliDecompress(
+                        &mut Cursor::new(compressed.data()), &mut counter);
+                    if counter.exceeded { return Err(Error::InsufficientMemory); }
+                    decoded.map_err(Error::IoError)?;
+                    // Includes ALL decompressed output, even trailing bytes which
+                    // the later first-superbox parser might otherwise ignore.
+                    counter.bytes
+                } else {
+                    raw_manifests[idx].len()
+                };
+                remaining = remaining.checked_sub(size).ok_or(Error::InsufficientMemory)?;
+                sizes.push(size);
+            }
+            Some(sizes)
+        } else { None };
         for idx in 0..num_stores {
             let store_box = CAIManifest::from(
                 cai_block
                     .data_box_as_superbox(idx)
                     .ok_or(Error::JumbfBoxNotFound)?,
-                max_manifest_size,
+                decoded_sizes.as_ref().map_or(max_manifest_size, |sizes| sizes[idx]),
             )?;
             let cai_store_box = store_box.super_box();
             let cai_store_desc_box = cai_store_box.desc_box();
@@ -1575,11 +1773,19 @@ impl Store {
 
             // save the hash of the loaded manifest for ingredient validation
             // and the signature box for Ingredient_v3
+            let mut normalized = Vec::new();
+            Store::build_manifest_box(&claim, 0)?.write_box(&mut normalized)?;
+            // Compressed stores retain the existing SDK path until a separate
+            // admitted decompressed-raw hash representation is available.
+            if !claim.compressed() {
+                claim.remember_manifest(raw_manifests[idx], sha256(&normalized));
+            }
+
             store.manifest_box_hash_cache.insert(
                 claim.label().to_owned(),
                 (
                     Store::calc_manifest_box_hash(&claim, None, claim.alg())?,
-                    Claim::calc_sig_box_hash(&claim, claim.alg())?,
+                    Store::calc_signature_box_hash(&claim, claim.alg())?,
                 ),
             );
 
@@ -5729,6 +5935,78 @@ pub mod tests {
         assert!(report.has_error(Error::UnsupportedType));
     }
 
+    // Parser-structure fixtures only. These are not signature/trust positives.
+    fn aggregate_mixed_parser_fixture(trailing: usize) -> (Vec<u8>, usize) {
+        use brotli::enc::BrotliEncoderParams;
+        let first = crate::utils::test::create_test_store().unwrap().to_jumbf_internal(0).unwrap();
+        let second = crate::utils::test::create_test_store().unwrap().to_jumbf_internal(0).unwrap();
+        let one = raw_manifest_boxes(&first).unwrap()[0].to_vec();
+        let two = raw_manifest_boxes(&second).unwrap()[0].to_vec();
+        let mut decoded = two.clone();
+        decoded.extend(std::iter::repeat_n(0x5a, trailing));
+        let mut compressed = Vec::new();
+        brotli::BrotliCompress(&mut Cursor::new(&decoded), &mut compressed, &BrotliEncoderParams::default()).unwrap();
+        let mut wrapper = JUMBFSuperBox::new("aggregate.inactive", Some(CAI_COMPRESSED_MANIFEST_UUID));
+        wrapper.add_data_box(Box::new(JUMBFBrotliContentBox::new(compressed)));
+        let mut cai = Cai::new();
+        cai.add_box(Box::new(wrapper));
+        cai.add_box(Box::new(BoxReader::read_super_box(&mut Cursor::new(&one)).unwrap()));
+        let mut bytes = Vec::new();
+        cai.super_box().write_box(&mut bytes).unwrap();
+        (bytes, one.len() + two.len() + trailing)
+    }
+
+    #[test]
+    fn aggregate_store_mixed_inactive_uncompressed_exact_byte_boundaries() {
+        let (bytes, n) = aggregate_mixed_parser_fixture(0);
+        for limit in [n - 1, n, n + 1] {
+            let parsed = Store::from_jumbf_impl(Store::new(), &bytes, &mut StatusTracker::default(), 32 * 1024 * 1024, Some(limit));
+            if limit < n {
+                assert!(matches!(parsed, Err(Error::InsufficientMemory)));
+            } else {
+                assert_eq!(parsed.unwrap().claims().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_store_counts_all_trailing_decoded_bytes() {
+        let (bytes, n) = aggregate_mixed_parser_fixture(7);
+        assert!(matches!(Store::from_jumbf_impl(Store::new(), &bytes, &mut StatusTracker::default(), 32 * 1024 * 1024, Some(n - 1)), Err(Error::InsufficientMemory)));
+        assert_eq!(Store::from_jumbf_impl(Store::new(), &bytes, &mut StatusTracker::default(), 32 * 1024 * 1024, Some(n)).unwrap().claims().len(), 2);
+    }
+
+    #[test]
+    fn aggregate_counter_zero_overflow_and_failure_before_materialization() {
+        use std::io::Write;
+        let mut counter = DecodedManifestCounter { limit: 3, bytes: 0, exceeded: false };
+        counter.write_all(&[1, 2]).unwrap();
+        counter.write_all(&[3]).unwrap();
+        assert!(counter.write_all(&[4]).is_err());
+        assert_eq!(counter.bytes, 3);
+        assert!(counter.exceeded);
+        let mut overflow = DecodedManifestCounter { limit: usize::MAX, bytes: usize::MAX, exceeded: false };
+        assert!(overflow.write_all(&[1]).is_err());
+        assert!(overflow.exceeded);
+        // Decoded zero bytes are not a valid manifest: over-budget must reject
+        // before CAIManifest/Claim parsing; at-budget must report malformed data.
+        let malformed = make_brotli_bomb_jumbf(32);
+        assert!(matches!(Store::from_jumbf_impl(Store::new(), &malformed, &mut StatusTracker::default(), 1024, Some(31)), Err(Error::InsufficientMemory)));
+        let parsed = Store::from_jumbf_impl(Store::new(), &malformed, &mut StatusTracker::default(), 1024, Some(32));
+        assert!(parsed.is_err() && !matches!(parsed, Err(Error::InsufficientMemory)));
+        let (bytes, _) = aggregate_mixed_parser_fixture(0);
+        assert!(matches!(Store::from_jumbf_impl(Store::new(), &bytes, &mut StatusTracker::default(), 1024 * 1024, Some(0)), Err(Error::InsufficientMemory)));
+    }
+
+    #[test]
+    fn aggregate_none_and_explicit_context_routes_preserve_semantics() {
+        let (bytes, _) = aggregate_mixed_parser_fixture(0);
+        assert_eq!(Store::from_jumbf_impl(Store::new(), &bytes, &mut StatusTracker::default(), 32 * 1024 * 1024, None).unwrap().claims().len(), 2);
+        let context = Context::new().with_settings(serde_json::json!({"core":{"max_decompressed_store_size_in_mb":0}})).unwrap();
+        assert!(matches!(Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &context), Err(Error::InsufficientMemory)));
+        assert_eq!(Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &Context::new()).unwrap().claims().len(), 2);
+    }
+
     fn make_brotli_bomb_jumbf(decompressed_size: usize) -> Vec<u8> {
         use brotli::enc::BrotliEncoderParams;
 
@@ -8801,6 +9079,220 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(reader.validation_state(), crate::ValidationState::Invalid);
+    }
+
+    #[test]
+    fn test_preparation_inactive_history_survives_store_resolver() {
+        let context = Context::new();
+        let mut file = std::fs::File::open(fixture_path("C.jpg")).unwrap();
+        let (bytes, _) = Store::load_jumbf_from_stream("image/jpeg", &mut file, &context).unwrap();
+        let mut source =
+            Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &context)
+                .unwrap();
+        let governing = source.provenance_claim().unwrap().clone();
+        let mut inactive = governing.clone();
+        inactive.set_conflict_label("urn:uuid:inactive-history".to_owned());
+        source.insert_restored_claim(inactive.label().to_owned(), inactive.clone());
+        source.set_provenance_path(&governing);
+        let resolved = Store::build_flat_ingredient_store(&source, &governing).unwrap();
+        assert!(
+            resolved.get_claim(inactive.label()).is_some(),
+            "unreferenced history must survive resolution"
+        );
+        assert_eq!(
+            resolved.provenance_claim().unwrap().label(),
+            governing.label()
+        );
+    }
+
+    #[test]
+    fn test_preparation_raw_cache_cannot_resurrect_changed_signatures() {
+        let context = Context::new();
+        let mut file = std::fs::File::open(fixture_path("C.jpg")).unwrap();
+        let (bytes, _) = Store::load_jumbf_from_stream("image/jpeg", &mut file, &context).unwrap();
+        let mut source =
+            Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &context)
+                .unwrap();
+        let claim = source.provenance_claim_mut().unwrap();
+        let mut normalized = Vec::new();
+        Store::build_manifest_box(claim, 0)
+            .unwrap()
+            .write_box(&mut normalized)
+            .unwrap();
+        assert!(claim.preserved_manifest(&sha256(&normalized)).is_some());
+        claim.set_signature_val(vec![0x21; 64]);
+        normalized.clear();
+        Store::build_manifest_box(claim, 0)
+            .unwrap()
+            .write_box(&mut normalized)
+            .unwrap();
+        assert!(claim.preserved_manifest(&sha256(&normalized)).is_none());
+        let serialized = source.to_jumbf_internal(0).unwrap();
+        let restored =
+            Store::from_jumbf_with_context(&serialized, &mut StatusTracker::default(), &context)
+                .unwrap();
+        assert_eq!(
+            restored.provenance_claim().unwrap().signature_val(),
+            &vec![0x21; 64]
+        );
+    }
+
+    #[test]
+    fn test_import_preserves_raw_manifest_box_description() {
+        // A manifest's optional JUMBF box ID is admitted by the existing parser.
+        // It is not part of claim CBOR, so preserving claim.data() is insufficient.
+        let context = crate::context::Context::new();
+        let mut source = std::fs::File::open(fixture_path("C.jpg")).unwrap();
+        let (mut bytes, _) =
+            Store::load_jumbf_from_stream("image/jpeg", &mut source, &context).unwrap();
+        let size = |data: &[u8], offset: usize| {
+            u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize
+        };
+        // This committed fixture uses 32-bit lengths and one leading store
+        // description followed by the first signed manifest superbox.
+        let manifest = 8 + size(&bytes, 8);
+        assert_eq!(&bytes[manifest + 4..manifest + 8], b"jumb");
+        let description = manifest + 8;
+        assert_eq!(&bytes[description + 4..description + 8], b"jumd");
+        let end = description + size(&bytes, description);
+        assert_eq!(bytes[description + 24], 3);
+        bytes[description + 24] |= 4;
+        bytes.splice(end..end, 0x2105_u32.to_be_bytes());
+        for offset in [0, manifest, description] {
+            let updated = (size(&bytes, offset) + 4) as u32;
+            bytes[offset..offset + 4].copy_from_slice(&updated.to_be_bytes());
+        }
+        let expected = &bytes[manifest..manifest + size(&bytes, manifest)];
+        // Exercise the real Claim import boundary, not Reader JSON equivalence.
+        let mut claim = create_test_claim().unwrap();
+        Store::load_ingredient_to_claim(&mut claim, &bytes, None, &context).unwrap();
+        let mut output = Store::from_context(&context);
+        output.commit_claim(claim).unwrap();
+        let candidate = output.to_jumbf_internal(4096).unwrap();
+        let imported = 8 + size(&candidate, 8);
+        assert_eq!(
+            &candidate[imported..imported + size(&candidate, imported)],
+            expected,
+            "ordinary ingredient import must preserve every prior signed manifest box byte"
+        );
+    }
+
+    #[test]
+    fn test_import_preserves_raw_signature_box_description_hash() {
+        // Same licensed committed fixture as the outer-manifest regression.
+        // A legal optional signature-box ID is outside claim CBOR/COSE, but
+        // inside the byte domain of Ingredient_v3's claimSignature hash.
+        let context = crate::context::Context::new();
+        let mut source = std::fs::File::open(fixture_path("C.jpg")).unwrap();
+        let (mut bytes, _) =
+            Store::load_jumbf_from_stream("image/jpeg", &mut source, &context).unwrap();
+        let size = |data: &[u8], offset: usize| {
+            u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize
+        };
+        let manifest = 8 + size(&bytes, 8);
+        let end = manifest + size(&bytes, manifest);
+        let mut signature = None;
+        let mut at = manifest + 8 + size(&bytes, manifest + 8);
+        while at < end {
+            let length = size(&bytes, at);
+            if &bytes[at + 4..at + 8] == b"jumb" {
+                let desc = at + 8;
+                let name = bytes[desc + 25..desc + size(&bytes, desc)]
+                    .split(|byte| *byte == 0)
+                    .next()
+                    .unwrap();
+                if name == b"c2pa.signature" {
+                    signature = Some(at);
+                    break;
+                }
+            }
+            at += length;
+        }
+        let signature = signature.expect("fixture has a signature superbox");
+        let description = signature + 8;
+        let insertion = description + size(&bytes, description);
+        assert_eq!(bytes[description + 24], 3);
+        bytes[description + 24] |= 4;
+        bytes.splice(insertion..insertion, 0x2105_u32.to_be_bytes());
+        for offset in [0, manifest, signature, description] {
+            let updated = (size(&bytes, offset) + 4) as u32;
+            bytes[offset..offset + 4].copy_from_slice(&updated.to_be_bytes());
+        }
+        let expected_raw = &bytes[manifest..manifest + size(&bytes, manifest)];
+        let mut loaded =
+            Store::from_jumbf_with_context(&bytes, &mut StatusTracker::default(), &context)
+                .unwrap();
+        let prior = loaded.claims()[0];
+        let label = prior.label().to_owned();
+        let expected_signature_hash = hash_by_alg(
+            prior.alg(),
+            &bytes[signature + 8..signature + size(&bytes, signature)],
+            None,
+        );
+
+        let mut claim = create_test_claim().unwrap();
+        Store::load_ingredient_to_claim(&mut claim, &bytes, None, &context).unwrap();
+        let mut output = Store::from_context(&context);
+        output.commit_claim(claim).unwrap();
+        let candidate = output.to_jumbf_internal(4096).unwrap();
+        let imported = 8 + size(&candidate, 8);
+        assert_eq!(
+            &candidate[imported..imported + size(&candidate, imported)],
+            expected_raw,
+            "the prior signed signature-box description must survive actual import"
+        );
+        assert_eq!(
+            loaded.get_manifest_box_hashes(prior).signature_box_hash,
+            expected_signature_hash,
+            "loaded claimSignature hash must cover actual raw payload"
+        );
+        assert_eq!(
+            output
+                .get_manifest_box_hashes(output.get_claim(&label).unwrap())
+                .signature_box_hash,
+            expected_signature_hash,
+            "imported claimSignature hash must cover the same preserved raw payload"
+        );
+        let alg = prior.alg().to_owned();
+        // The loaded path has a populated cache; the imported Store exercises
+        // its fallback. Independently hash the signature payload actually
+        // serialized after each mutation, not either implementation helper.
+        for store in [&mut loaded, &mut output] {
+            store
+                .get_claim_mut(&label)
+                .unwrap()
+                .set_signature_val(vec![0x21; 64]);
+            let serialized = store.to_jumbf_internal(0).unwrap();
+            let manifest = 8 + size(&serialized, 8);
+            let end = manifest + size(&serialized, manifest);
+            let mut at = manifest + 8 + size(&serialized, manifest + 8);
+            let mut actual_signature_hash = None;
+            while at < end {
+                let length = size(&serialized, at);
+                if &serialized[at + 4..at + 8] == b"jumb" {
+                    let desc = at + 8;
+                    let name = serialized[desc + 25..desc + size(&serialized, desc)]
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .unwrap();
+                    if name == b"c2pa.signature" {
+                        actual_signature_hash =
+                            Some(hash_by_alg(&alg, &serialized[at + 8..at + length], None));
+                        break;
+                    }
+                }
+                at += length;
+            }
+            let expected_changed = actual_signature_hash.unwrap();
+            assert_ne!(expected_changed, expected_signature_hash);
+            assert_eq!(
+                store
+                    .get_manifest_box_hashes(store.get_claim(&label).unwrap())
+                    .signature_box_hash,
+                expected_changed,
+                "loaded/imported hash paths must follow the changed actual signature payload"
+            );
+        }
     }
 
     #[test]

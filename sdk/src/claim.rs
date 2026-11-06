@@ -320,6 +320,10 @@ pub struct Claim {
     // original JSON bytes of claim; only present when reading from asset
     original_bytes: Option<Vec<u8>>,
 
+    // Exact imported manifest box plus its normalized reconstruction fingerprint.
+    // Shared across ingredient clones; mutations are detected before raw reuse.
+    original_manifest: Option<(Arc<[u8]>, Vec<u8>)>,
+
     // original JUMBF box order need to recalculate JUMBF box hash
     original_box_order: Option<Vec<&'static str>>,
 
@@ -446,6 +450,7 @@ impl Claim {
             vc_store: Vec::new(),
             assertions: Vec::new(),
             original_bytes: None,
+            original_manifest: None,
             original_box_order: None,
             redacted_assertions: None,
             alg: Some(BUILD_HASH_ALG.to_string()),
@@ -547,6 +552,7 @@ impl Claim {
             vc_store: Vec::new(),
             assertions: Vec::new(),
             original_bytes: None,
+            original_manifest: None,
             original_box_order: None,
             redacted_assertions: None,
             alg: Some(BUILD_HASH_ALG.into()),
@@ -690,6 +696,7 @@ impl Claim {
                 signature,
                 assertions,
                 original_bytes: Some(data.to_owned()),
+                original_manifest: None,
                 original_box_order: None,
                 redacted_assertions,
                 alg,
@@ -800,6 +807,7 @@ impl Claim {
                 signature,
                 assertions,
                 original_bytes: Some(data.to_owned()),
+                original_manifest: None,
                 original_box_order: None,
                 redacted_assertions,
                 alg,
@@ -3678,6 +3686,16 @@ impl Claim {
             Some(ref ob) => Ok(ob.clone()),
             None => Ok(c2pa_cbor::ser::to_vec(&self).map_err(|_err| Error::ClaimEncoding)?),
         }
+    }
+
+    pub(crate) fn remember_manifest(&mut self, bytes: &[u8], normalized_hash: Vec<u8>) {
+        self.original_manifest = Some((Arc::from(bytes), normalized_hash));
+    }
+
+    pub(crate) fn preserved_manifest(&self, normalized_hash: &[u8]) -> Option<Arc<[u8]>> {
+        self.original_manifest
+            .as_ref()
+            .and_then(|(bytes, expected)| (expected == normalized_hash).then(|| Arc::clone(bytes)))
     }
 
     pub(crate) fn clear_data(&mut self) {
