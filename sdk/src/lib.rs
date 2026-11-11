@@ -246,6 +246,7 @@ pub use assertions::DigitalSourceType;
 #[doc(inline)]
 pub use assertions::Relationship;
 pub use assertions::{compute_bmff_flat_hash, compute_bmff_mdat_merkle_roots};
+pub use asset_handlers::bmff_io::{read_bmff_video_track, BmffVideoTrack};
 pub use builder::{Builder, BuilderIntent, HashType, ManifestDefinition};
 pub use callback_signer::{CallbackFunc, CallbackSigner};
 pub use claim_generator_info::ClaimGeneratorInfo;
