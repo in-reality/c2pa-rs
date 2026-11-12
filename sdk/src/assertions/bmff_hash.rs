@@ -2440,7 +2440,7 @@ impl BmffHash {
         const MDAT_EXCLUSION_SIZE: u64 = 16;
 
         // find the hash ranges for each mdat
-        for (box_info, merkle_map) in mdats.into_iter().zip(mm_vec) {
+        for (index, (box_info, merkle_map)) in mdats.into_iter().zip(mm_vec).enumerate() {
             if let Some(fixed_block_size) = merkle_map.fixed_block_size {
                 let mut block_start = box_info.start().saturating_add(MDAT_EXCLUSION_SIZE);
                 let mut bytes_left = box_info.size().saturating_sub(MDAT_EXCLUSION_SIZE);
