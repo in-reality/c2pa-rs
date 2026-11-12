@@ -14,6 +14,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
+    sync::Arc,
 };
 
 use async_generic::async_generic;
@@ -58,6 +59,35 @@ use crate::{
     AsyncSigner, Signer,
 };
 
+// Opt-in complete-store decoded-byte preflight. Counts output only; never
+// allocates a decoded Vec. Brotli's own bounded working memory is not this quota.
+struct DecodedManifestCounter {
+    limit: usize,
+    bytes: usize,
+    exceeded: bool,
+}
+impl std::io::Write for DecodedManifestCounter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.checked_add(data.len());
+        if next.is_none_or(|n| n > self.limit) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "decoded store budget",
+            ));
+        }
+        self.bytes = next.unwrap();
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "linkedin_test.rs"]
+mod linkedin_test;
+
 pub(super) const MANIFEST_STORE_EXT: &str = "c2pa"; // file extension for external manifests
 
 /// Maximum depth of nested ingredient references allowed during validation.
@@ -90,6 +120,72 @@ pub struct Store {
     pub(super) ctp: CertificateTrustPolicy,
     pub(super) remote_url: Option<String>,
     pub(super) embedded: bool,
+}
+
+// Imported manifests own exact boxes. A no-header wrapper lets Cai retain the
+// original framing, descriptor, compression and resource bytes verbatim.
+#[derive(Debug)]
+struct PreservedManifestBox(Arc<[u8]>);
+impl BMFFBox for PreservedManifestBox {
+    fn box_type(&self) -> &'static [u8; 4] {
+        b"    "
+    }
+    fn box_uuid(&self) -> &'static str {
+        JUMB_FOURCC
+    }
+    fn box_payload_size(&self) -> std::io::Result<u32> {
+        u32::try_from(self.0.len()).map_err(|_| std::io::Error::other("manifest size"))
+    }
+    fn write_box_payload(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writer.write_all(&self.0)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// Read only framing here. SDK parsing/validation still determines supported
+// contents; ranges retain the original bytes rather than reserializing them.
+fn raw_box_range(bytes: &[u8], at: usize) -> Result<(usize, usize)> {
+    let header = bytes
+        .get(at..at.checked_add(8).ok_or(Error::JumbfCreationError)?)
+        .ok_or(Error::JumbfCreationError)?;
+    let short = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let (size, header_len) = match short {
+        0 => (bytes.len() - at, 8),
+        1 => {
+            let long = bytes
+                .get(at + 8..at + 16)
+                .ok_or(Error::JumbfCreationError)?;
+            (
+                usize::try_from(u64::from_be_bytes(long.try_into().unwrap()))
+                    .map_err(|_| Error::JumbfCreationError)?,
+                16,
+            )
+        }
+        n => (n as usize, 8),
+    };
+    if size < header_len {
+        return Err(Error::JumbfCreationError);
+    }
+    let end = at
+        .checked_add(size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(Error::JumbfCreationError)?;
+    Ok((end, header_len))
+}
+
+fn raw_manifest_boxes(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let (end, header) = raw_box_range(bytes, 0)?;
+    let store = &bytes[..end];
+    let (mut at, _) = raw_box_range(store, header)?; // skip store description
+    let mut boxes = Vec::new();
+    while at < store.len() {
+        let (next, _) = raw_box_range(store, at)?;
+        boxes.push(&store[at..next]);
+        at = next;
+    }
+    Ok(boxes)
 }
 
 struct ManifestInfo<'a> {
@@ -249,7 +345,7 @@ impl Store {
             ManifestHashes {
                 manifest_box_hash: Store::calc_manifest_box_hash(claim, None, claim.alg())
                     .unwrap_or_default(),
-                signature_box_hash: Claim::calc_sig_box_hash(claim, claim.alg())
+                signature_box_hash: Store::calc_signature_box_hash(claim, claim.alg())
                     .unwrap_or_default(),
             }
         }
@@ -405,6 +501,9 @@ impl Store {
     /// Get Claim by label
     // Returns Option<&Claim>
     pub fn get_claim_mut(&mut self, label: &str) -> Option<&mut Claim> {
+        // Mutable access can invalidate a loaded box hash, even if a raw box
+        // is retained for fingerprint-guarded serialization.
+        self.manifest_box_hash_cache.remove(label);
         self.claims_map.get_mut(label)
     }
 
@@ -577,7 +676,30 @@ impl Store {
             Ok(())
         }
 
+        // Importing the governing claim retains complete inactive history.
+        // An older requested ingredient still resolves only its own ancestry.
+        if store
+            .provenance_claim()
+            .is_some_and(|active| active.label() == claim.label())
+        {
+            for inactive in store.claims() {
+                if inactive.label() != claim.label() {
+                    collect_flat(
+                        store,
+                        inactive,
+                        &mut ingredient_store,
+                        &mut visited,
+                        &mut path,
+                    )?;
+                }
+            }
+        }
         collect_flat(store, claim, &mut ingredient_store, &mut visited, &mut path)?;
+        ingredient_store
+            .claims
+            .retain(|label| label != claim.label());
+        ingredient_store.claims.push(claim.label().to_owned());
+        ingredient_store.set_provenance_path(claim);
 
         Ok(ingredient_store)
     }
@@ -802,9 +924,13 @@ impl Store {
         // Add claims and assertions in this store to the JUMBF store.
         for claim in self.claims() {
             let cai_store = Store::build_manifest_box(claim, min_reserve_size)?;
-
-            // add the completed CAI store into the CAI block.
-            cai_block.add_box(Box::new(cai_store));
+            let mut normalized = Vec::new();
+            cai_store.write_box(&mut normalized)?;
+            if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+                cai_block.add_box(Box::new(PreservedManifestBox(raw)));
+            } else {
+                cai_block.add_box(Box::new(cai_store));
+            }
         }
 
         // Write it to memory.
@@ -921,6 +1047,42 @@ impl Store {
         Ok(cai_store)
     }
 
+    // Ingredient_v3 claimSignature hashes cover the actual signature superbox
+    // payload, including optional descriptor bytes. Reuse raw bytes only when
+    // the complete claim still matches the preserved serialization fingerprint.
+    fn calc_signature_box_hash(claim: &Claim, alg: &str) -> Result<Vec<u8>> {
+        let mut normalized = Vec::new();
+        Store::build_manifest_box(claim, 0)?.write_box(&mut normalized)?;
+        if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+            let (end, mut at) = raw_box_range(&raw, 0)?;
+            let mut payload = None;
+            while at < end {
+                let (next, header) = raw_box_range(&raw, at)?;
+                if &raw[at + 4..at + 8] == b"jumb" {
+                    let child = &raw[at..next];
+                    let (desc_end, desc_header) = raw_box_range(child, header)?;
+                    if &child[header + 4..header + 8] != b"jumd" {
+                        return Err(Error::JumbfCreationError);
+                    }
+                    let uuid = child
+                        .get(header + desc_header..header + desc_header + 16)
+                        .filter(|_| desc_end >= header + desc_header + 16)
+                        .ok_or(Error::JumbfCreationError)?;
+                    if hex::encode_upper(uuid) == CAI_SIGNATURE_UUID {
+                        if payload.is_some() {
+                            return Err(Error::JumbfCreationError);
+                        }
+                        payload = Some(at + header..next);
+                    }
+                }
+                at = next;
+            }
+            let payload = payload.ok_or(Error::JumbfCreationError)?;
+            return Ok(hash_by_alg(alg, &raw[payload], None));
+        }
+        Claim::calc_sig_box_hash(claim, alg)
+    }
+
     // calculate the hash of the manifest JUMBF box
     pub fn calc_manifest_box_hash(
         claim: &Claim,
@@ -933,13 +1095,20 @@ impl Store {
         let mut cai_store = Store::build_manifest_box(claim, 0)?;
 
         // add salt if requested
-        if let Some(salt) = salt {
-            cai_store.set_salt(salt)?;
+        if let Some(ref salt) = salt {
+            cai_store.set_salt(salt.clone())?;
         }
 
-        // box content as Vec
+        let mut normalized = Vec::new();
+        cai_store.write_box(&mut normalized)?;
+        // Explicit salting asks for a modified box; never reuse an unsalted raw one.
+        if salt.is_none() {
+            if let Some(raw) = claim.preserved_manifest(&sha256(&normalized)) {
+                let (_, header) = raw_box_range(&raw, 0)?;
+                return Ok(hash_by_alg(alg, &raw[header..], None));
+            }
+        }
         cai_store.super_box().write_box_payload(&mut hash_bytes)?;
-
         Ok(hash_by_alg(alg, &hash_bytes, None))
     }
 
@@ -974,7 +1143,17 @@ impl Store {
             .core
             .max_decompressed_manifest_size_in_mb
             .saturating_mul(1024 * 1024);
-        Self::from_jumbf_impl(Store::new(), buffer, validation_log, max_manifest_size)
+        let max_store_size = get_thread_local_settings()
+            .core
+            .max_decompressed_store_size_in_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024));
+        Self::from_jumbf_impl(
+            Store::new(),
+            buffer,
+            validation_log,
+            max_manifest_size,
+            max_store_size,
+        )
     }
 
     #[inline]
@@ -993,6 +1172,11 @@ impl Store {
             buffer,
             validation_log,
             max_manifest_size,
+            context
+                .settings()
+                .core
+                .max_decompressed_store_size_in_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024)),
         )
     }
 
@@ -1001,6 +1185,7 @@ impl Store {
         buffer: &[u8],
         validation_log: &mut StatusTracker,
         max_manifest_size: usize,
+        max_store_size: Option<usize>,
     ) -> Result<Store> {
         if buffer.is_empty() {
             return Err(Error::JumbfNotFound);
@@ -1027,12 +1212,53 @@ impl Store {
         }
 
         let num_stores = cai_block.data_box_count();
+        let raw_manifests = raw_manifest_boxes(buffer)?;
+        if raw_manifests.len() != num_stores {
+            return Err(Error::JumbfCreationError);
+        }
+        // Inspect EVERY raw manifest, including inactive/unreachable/ignored
+        // UUIDs, before any CAIManifest decoded Vec/Claim/assertion allocation.
+        let decoded_sizes = if let Some(mut remaining) = max_store_size {
+            let mut sizes = Vec::with_capacity(num_stores);
+            for idx in 0..num_stores {
+                let raw_box = cai_block
+                    .data_box_as_superbox(idx)
+                    .ok_or(Error::JumbfBoxNotFound)?;
+                let size = if let Some(compressed) = raw_box.data_box_as_brotli_box(0) {
+                    let mut counter = DecodedManifestCounter {
+                        limit: remaining.min(max_manifest_size),
+                        bytes: 0,
+                        exceeded: false,
+                    };
+                    let decoded =
+                        brotli::BrotliDecompress(&mut Cursor::new(compressed.data()), &mut counter);
+                    if counter.exceeded {
+                        return Err(Error::InsufficientMemory);
+                    }
+                    decoded.map_err(Error::IoError)?;
+                    // Includes ALL decompressed output, even trailing bytes which
+                    // the later first-superbox parser might otherwise ignore.
+                    counter.bytes
+                } else {
+                    raw_manifests[idx].len()
+                };
+                remaining = remaining
+                    .checked_sub(size)
+                    .ok_or(Error::InsufficientMemory)?;
+                sizes.push(size);
+            }
+            Some(sizes)
+        } else {
+            None
+        };
         for idx in 0..num_stores {
             let store_box = CAIManifest::from(
                 cai_block
                     .data_box_as_superbox(idx)
                     .ok_or(Error::JumbfBoxNotFound)?,
-                max_manifest_size,
+                decoded_sizes
+                    .as_ref()
+                    .map_or(max_manifest_size, |sizes| sizes[idx]),
             )?;
             let cai_store_box = store_box.super_box();
             let cai_store_desc_box = cai_store_box.desc_box();
@@ -1375,13 +1601,21 @@ impl Store {
                 }
             }
 
+            // Preserve imported bytes only when the complete normalized claim
+            // still matches; compressed stores keep their existing SDK path.
+            let mut normalized = Vec::new();
+            Store::build_manifest_box(&claim, 0)?.write_box(&mut normalized)?;
+            if !claim.compressed() {
+                claim.remember_manifest(raw_manifests[idx], sha256(&normalized));
+            }
+
             // save the hash of the loaded manifest for ingredient validation
             // and the signature box for Ingredient_v3
             store.manifest_box_hash_cache.insert(
                 claim.label().to_owned(),
                 (
                     Store::calc_manifest_box_hash(&claim, None, claim.alg())?,
-                    Claim::calc_sig_box_hash(&claim, claim.alg())?,
+                    Store::calc_signature_box_hash(&claim, claim.alg())?,
                 ),
             );
 

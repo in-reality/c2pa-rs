@@ -225,6 +225,30 @@ or store padding, or reimplementing SDK identity semantics.
 
 ---
 
+## Imported signed-history preservation and bounded store decoding
+
+**Where:** `sdk/src/claim/claim_core.rs`, `sdk/src/store/store_core.rs`, and
+`src/settings/mod.rs`.
+
+**What:** An imported, uncompressed manifest retains its exact JUMBF box bytes
+alongside a fingerprint of the SDK's normalized reconstruction. Serialization
+and manifest/signature box hashing reuse those original bytes only while the
+fingerprint still matches; a changed claim or signature takes the normal SDK
+path. Importing a governing ingredient retains earlier inactive manifests in
+their original byte order. The optional aggregate decoded-store cap counts
+all manifest output, including inactive compressed boxes and trailing decoded
+bytes, before materializing claims. The default remains unbounded at the
+aggregate level, with the existing per-manifest limit unchanged.
+
+**Why:** LinkedIn preparation must preserve signed prior history and media bytes
+without accepting a stale raw cache after mutation. The opt-in aggregate cap
+bounds imported credential decoding before an oversized store allocates memory.
+The maintained 0.91.11 module layout and its separate manifest/TSA trust policy
+remain in force. Focused tests live in `sdk/src/store/linkedin_test.rs` and
+`src/settings/mod.rs`.
+
+---
+
 ## Remaining upstream issuer-purpose limitation
 
 The integrated Rust-native path rejects non-CA delegation, enforces presented
