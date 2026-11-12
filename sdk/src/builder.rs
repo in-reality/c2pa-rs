@@ -2807,6 +2807,33 @@ impl Builder {
         Ok(())
     }
 
+    /// Injects explicit per-mdat sizes and complete ordered SHA-256 leaf rows.
+    ///
+    /// Requires an existing BMFF v3 assertion. Stream verification checks
+    /// actual payload coverage; this does not change the legacy fixed API.
+    pub fn set_bmff_mdat_variable_hashes(
+        &mut self,
+        leaf_hashes: Vec<Vec<Vec<u8>>>,
+        block_sizes: Vec<Vec<u64>>,
+    ) -> Result<()> {
+        let mut bmff_hash = self.find_assertion::<BmffHash>(BmffHash::LABEL)?;
+        let stored_label = self
+            .definition
+            .assertions
+            .iter()
+            .find(|a| a.label().contains(BmffHash::LABEL))
+            .map(|a| a.label().to_owned())
+            .ok_or(Error::NotFound)?;
+        let (_, version, _) = parse_label(&stored_label);
+        bmff_hash.set_bmff_version(version);
+        bmff_hash.add_mdat_variable_leaf_hashes(leaf_hashes, block_sizes)?;
+        self.definition
+            .assertions
+            .retain(|a| !a.label().contains(BmffHash::LABEL));
+        self.add_assertion(stored_label, &bmff_hash)?;
+        Ok(())
+    }
+
     /// Sets a fixed Merkle leaf size for the BMFF hash calculation in the Builder.
     /// This is an optional setting that affects how the BMFF hash is calculated when
     /// hashing mdat bytes as they are written (see `hash_bmff_mdat_bytes`).  By default,

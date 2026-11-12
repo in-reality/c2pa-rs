@@ -13,7 +13,7 @@
 
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
 };
@@ -2870,6 +2870,161 @@ fn read_child<R: Read + Seek + ?Sized>(
     Ok((header.name, content_start, box_end))
 }
 
+/// Identity and handler of the unique video track in a BMFF container.
+///
+/// This is metadata extraction only, not signature, binding, timing, codec or
+/// product-admission evidence. A validating caller must retain those gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BmffVideoTrack {
+    /// Actual nonzero `tkhd.track_ID`; track ordering does not select it.
+    pub track_id: u32,
+    /// Actual `mdia/hdlr` four-character handler type (`vide`).
+    pub handler_type: [u8; 4],
+}
+
+/// Read the unique video track's ID and handler from a seekable BMFF stream.
+///
+/// Scans from offset zero, using checked box boundaries, and only descends into
+/// `moov/trak/mdia`. Sample tables, `mdat` and all timing fields are skipped.
+/// Every inspected header, including a skipped box, consumes one of the caller's
+/// explicit `max_box_headers` budget. Cursor position after the call is unspecified.
+/// This query budget does not change any other reader or upload admission.
+///
+/// Returns [`Error::InvalidAsset`] for malformed/missing/duplicate inspected
+/// headers or zero/duplicate track IDs. Exhausted budget, unsupported header
+/// versions, absent video or multiple video tracks return [`Error::UnsupportedType`].
+pub fn read_bmff_video_track<R: Read + Seek + ?Sized>(
+    reader: &mut R,
+    max_box_headers: u32,
+) -> Result<BmffVideoTrack> {
+    if max_box_headers == 0 {
+        return Err(Error::UnsupportedType);
+    }
+    let end = stream_len(reader)?;
+    let mut remaining = max_box_headers;
+    let mut pos = 0;
+    let mut movie = false;
+    let mut ids = HashSet::new();
+    let mut video = None;
+    while pos < end {
+        let (name, start, box_end) = metadata_child(reader, pos, end, &mut remaining)?;
+        if name == BoxType::MoovBox {
+            if movie {
+                return Err(Error::InvalidAsset("duplicate BMFF moov".into()));
+            }
+            movie = true;
+            let mut at = start;
+            while at < box_end {
+                let (name, start, child_end) = metadata_child(reader, at, box_end, &mut remaining)?;
+                if name == BoxType::TrakBox {
+                    let track = metadata_track(reader, start, child_end, &mut remaining)?;
+                    if !ids.insert(track.track_id) {
+                        return Err(Error::InvalidAsset("duplicate BMFF track ID".into()));
+                    }
+                    if track.handler_type == *b"vide" {
+                        if video.is_some() {
+                            return Err(Error::UnsupportedType);
+                        }
+                        video = Some(track);
+                    }
+                }
+                at = child_end;
+            }
+        }
+        pos = box_end;
+    }
+    if !movie {
+        return Err(Error::InvalidAsset("BMFF moov missing".into()));
+    }
+    video.ok_or(Error::UnsupportedType)
+}
+
+fn metadata_child<R: Read + Seek + ?Sized>(
+    reader: &mut R,
+    pos: u64,
+    end: u64,
+    remaining: &mut u32,
+) -> Result<(BoxType, u64, u64)> {
+    if *remaining == 0 {
+        return Err(Error::UnsupportedType);
+    }
+    *remaining -= 1;
+    if end
+        .checked_sub(pos)
+        .map(|n| n < HEADER_SIZE)
+        .unwrap_or(true)
+    {
+        return Err(Error::InvalidAsset("truncated BMFF metadata header".into()));
+    }
+    read_child(reader, pos, end)
+}
+
+fn metadata_track<R: Read + Seek + ?Sized>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    remaining: &mut u32,
+) -> Result<BmffVideoTrack> {
+    let mut pos = start;
+    let mut id = None;
+    let mut handler = None;
+    while pos < end {
+        let (name, start, child_end) = metadata_child(reader, pos, end, remaining)?;
+        match name {
+            BoxType::TkhdBox => {
+                if id.is_some() || child_end - start < 4 {
+                    return Err(Error::InvalidAsset("duplicate/truncated BMFF tkhd".into()));
+                }
+                reader.seek(SeekFrom::Start(start))?;
+                let (version, _) = read_box_header_ext(reader)?;
+                if version > 1 {
+                    return Err(Error::UnsupportedType);
+                }
+                let track_id = parse_tkhd_track_id(reader, start, child_end)?;
+                if track_id == 0 {
+                    return Err(Error::InvalidAsset("zero BMFF track ID".into()));
+                }
+                id = Some(track_id);
+            }
+            BoxType::MdiaBox => {
+                if handler.is_some() {
+                    return Err(Error::InvalidAsset("duplicate BMFF mdia".into()));
+                }
+                let mut at = start;
+                let mut found = None;
+                while at < child_end {
+                    let (name, data, box_end) = metadata_child(reader, at, child_end, remaining)?;
+                    if name == BoxType::HdlrBox {
+                        if found.is_some() || box_end - data < 12 {
+                            return Err(Error::InvalidAsset(
+                                "duplicate/truncated BMFF hdlr".into(),
+                            ));
+                        }
+                        reader.seek(SeekFrom::Start(data))?;
+                        let (version, _) = read_box_header_ext(reader)?;
+                        if version != 0 {
+                            return Err(Error::UnsupportedType);
+                        }
+                        reader.seek(SeekFrom::Current(4))?; // pre_defined
+                        let mut kind = [0; 4];
+                        reader.read_exact(&mut kind)?;
+                        found = Some(kind);
+                    }
+                    at = box_end;
+                }
+                handler =
+                    Some(found.ok_or_else(|| Error::InvalidAsset("BMFF hdlr missing".into()))?);
+            }
+            _ => {}
+        }
+        pos = child_end;
+    }
+    Ok(BmffVideoTrack {
+        track_id: id.ok_or_else(|| Error::InvalidAsset("BMFF tkhd missing".into()))?,
+        handler_type: handler.ok_or_else(|| Error::InvalidAsset("BMFF mdia missing".into()))?,
+    })
+}
+
 /// Scans the children in `[start, end)` for the first box of `target`, returning
 /// its `(content_start, box_end)`.
 fn find_box<R: Read + Seek + ?Sized>(
@@ -4022,6 +4177,279 @@ pub mod tests {
         b.extend_from_slice(&[0u8; 4]); // truncated before track_id
         let mut reader = Cursor::new(b);
         assert!(parse_tkhd_track_id(&mut reader, 0, 8).is_err());
+    }
+
+    fn video_metadata_box(name: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn video_metadata_tkhd(id: u32, version: u8) -> Vec<u8> {
+        let mut data = vec![0; if version == 1 { 96 } else { 84 }];
+        data[0] = version;
+        let at = if version == 1 { 20 } else { 12 };
+        data[at..at + 4].copy_from_slice(&id.to_be_bytes());
+        video_metadata_box(b"tkhd", &data)
+    }
+
+    fn video_metadata_mdia(kind: &[u8; 4]) -> Vec<u8> {
+        let mut data = vec![0; 24];
+        data[8..12].copy_from_slice(kind);
+        video_metadata_box(b"mdia", &video_metadata_box(b"hdlr", &data))
+    }
+
+    fn video_metadata_trak(id: u32, kind: &[u8; 4], version: u8) -> Vec<u8> {
+        video_metadata_box(
+            b"trak",
+            &[video_metadata_tkhd(id, version), video_metadata_mdia(kind)].concat(),
+        )
+    }
+
+    #[test]
+    fn video_metadata_selects_actual_id_with_audio_first_and_versions() {
+        for version in [0, 1] {
+            let bytes = video_metadata_box(
+                b"moov",
+                &[
+                    video_metadata_trak(2, b"soun", 0),
+                    video_metadata_trak(7, b"vide", version),
+                ]
+                .concat(),
+            );
+            let mut reader = Cursor::new(bytes);
+            reader.set_position(3); // Query starts at the container, not caller cursor.
+            assert_eq!(
+                read_bmff_video_track(&mut reader, 9).unwrap(),
+                BmffVideoTrack {
+                    track_id: 7,
+                    handler_type: *b"vide"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn video_metadata_requires_unique_complete_headers_and_ids() {
+        let tkhd = video_metadata_tkhd(7, 0);
+        let mdia = video_metadata_mdia(b"vide");
+        let valid = video_metadata_trak(7, b"vide", 0);
+        let mut hdlr = vec![0; 24];
+        hdlr[8..12].copy_from_slice(b"vide");
+        let malformed = [
+            video_metadata_box(b"free", &[]), // no moov
+            [
+                video_metadata_box(b"moov", &valid),
+                video_metadata_box(b"moov", &[]),
+            ]
+            .concat(),
+            video_metadata_box(b"moov", &video_metadata_box(b"trak", &mdia)),
+            video_metadata_box(b"moov", &video_metadata_box(b"trak", &tkhd)),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[tkhd.clone(), tkhd.clone(), mdia.clone()].concat(),
+                ),
+            ),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[tkhd.clone(), mdia.clone(), mdia.clone()].concat(),
+                ),
+            ),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[tkhd.clone(), video_metadata_box(b"mdia", &[])].concat(),
+                ),
+            ),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[
+                        tkhd.clone(),
+                        video_metadata_box(
+                            b"mdia",
+                            &[
+                                video_metadata_box(b"hdlr", &hdlr),
+                                video_metadata_box(b"hdlr", &hdlr),
+                            ]
+                            .concat(),
+                        ),
+                    ]
+                    .concat(),
+                ),
+            ),
+            video_metadata_box(b"moov", &video_metadata_trak(0, b"vide", 0)),
+            video_metadata_box(
+                b"moov",
+                &[valid.clone(), video_metadata_trak(7, b"soun", 0)].concat(),
+            ),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[video_metadata_box(b"tkhd", &[0; 8]), mdia.clone()].concat(),
+                ),
+            ),
+            video_metadata_box(
+                b"moov",
+                &video_metadata_box(
+                    b"trak",
+                    &[
+                        tkhd,
+                        video_metadata_box(b"mdia", &video_metadata_box(b"hdlr", &[0; 8])),
+                    ]
+                    .concat(),
+                ),
+            ),
+            [video_metadata_box(b"moov", &valid), vec![0; 4]].concat(),
+        ];
+        for (case, bytes) in malformed.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    read_bmff_video_track(&mut Cursor::new(bytes), 100),
+                    Err(Error::InvalidAsset(_))
+                ),
+                "malformed case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_metadata_refuses_ambiguity_unknown_versions_and_budget() {
+        for tracks in [
+            video_metadata_trak(2, b"soun", 0),
+            [
+                video_metadata_trak(7, b"vide", 0),
+                video_metadata_trak(9, b"vide", 1),
+            ]
+            .concat(),
+            video_metadata_trak(7, b"vide", 2),
+        ] {
+            assert!(matches!(
+                read_bmff_video_track(&mut Cursor::new(video_metadata_box(b"moov", &tracks)), 100),
+                Err(Error::UnsupportedType)
+            ));
+        }
+        let mut hdlr = vec![0; 24];
+        hdlr[0] = 1;
+        hdlr[8..12].copy_from_slice(b"vide");
+        let track = video_metadata_box(
+            b"trak",
+            &[
+                video_metadata_tkhd(7, 0),
+                video_metadata_box(b"mdia", &video_metadata_box(b"hdlr", &hdlr)),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            read_bmff_video_track(&mut Cursor::new(video_metadata_box(b"moov", &track)), 100),
+            Err(Error::UnsupportedType)
+        ));
+        let valid = video_metadata_box(b"moov", &video_metadata_trak(7, b"vide", 0));
+        for budget in [0, 1, 4] {
+            assert!(matches!(
+                read_bmff_video_track(&mut Cursor::new(&valid), budget),
+                Err(Error::UnsupportedType)
+            ));
+        }
+        assert_eq!(
+            read_bmff_video_track(&mut Cursor::new(valid), 5)
+                .unwrap()
+                .track_id,
+            7
+        );
+    }
+
+    #[test]
+    fn video_metadata_checks_parent_bounds_and_extended_headers() {
+        let mut overrun = 100u32.to_be_bytes().to_vec();
+        overrun.extend_from_slice(b"trak");
+        assert!(matches!(
+            read_bmff_video_track(&mut Cursor::new(video_metadata_box(b"moov", &overrun)), 100),
+            Err(Error::InvalidAsset(_))
+        ));
+        let mut short = 4u32.to_be_bytes().to_vec();
+        short.extend_from_slice(b"free");
+        assert!(matches!(
+            read_bmff_video_track(&mut Cursor::new(short), 100),
+            Err(Error::InvalidAsset(_))
+        ));
+        let payload = video_metadata_trak(7, b"vide", 1);
+        let mut large = 1u32.to_be_bytes().to_vec();
+        large.extend_from_slice(b"moov");
+        large.extend_from_slice(&(16 + payload.len() as u64).to_be_bytes());
+        large.extend_from_slice(&payload);
+        assert_eq!(
+            read_bmff_video_track(&mut Cursor::new(large), 5)
+                .unwrap()
+                .track_id,
+            7
+        );
+        let mut eof = 0u32.to_be_bytes().to_vec();
+        eof.extend_from_slice(b"moov");
+        eof.extend_from_slice(&payload);
+        assert_eq!(
+            read_bmff_video_track(&mut Cursor::new(eof), 5)
+                .unwrap()
+                .track_id,
+            7
+        );
+    }
+
+    #[test]
+    fn video_metadata_skips_sample_tables_and_mdat_payload() {
+        struct HeaderReadOnly {
+            data: Cursor<Vec<u8>>,
+            forbidden: Vec<std::ops::Range<u64>>,
+        }
+        impl Read for HeaderReadOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let at = self.data.position();
+                if self
+                    .forbidden
+                    .iter()
+                    .any(|range| at < range.end && at + bytes.len() as u64 > range.start)
+                {
+                    return Err(std::io::Error::other("payload must not be read"));
+                }
+                self.data.read(bytes)
+            }
+        }
+        impl Seek for HeaderReadOnly {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+        let mdat = video_metadata_box(b"mdat", &[0xff; 4096]);
+        let mut mdia = video_metadata_mdia(b"vide");
+        let minf = video_metadata_box(b"minf", &[0xff; 4096]);
+        // Append an opaque sample-table container as a sibling of hdlr.
+        let mut payload = mdia.split_off(8);
+        let minf_at = payload.len();
+        payload.extend_from_slice(&minf);
+        mdia = video_metadata_box(b"mdia", &payload);
+        let tkhd = video_metadata_tkhd(7, 0);
+        let minf_payload_at = mdat.len() + 8 + 8 + tkhd.len() + 8 + minf_at + 8;
+        let moov = video_metadata_box(
+            b"moov",
+            &video_metadata_box(b"trak", &[tkhd, mdia].concat()),
+        );
+        let bytes = [mdat.clone(), moov].concat();
+        let mut reader = HeaderReadOnly {
+            data: Cursor::new(bytes),
+            forbidden: vec![
+                8..mdat.len() as u64,
+                minf_payload_at as u64..(minf_payload_at + 4096) as u64,
+            ],
+        };
+        assert_eq!(read_bmff_video_track(&mut reader, 7).unwrap().track_id, 7);
     }
 
     #[test]

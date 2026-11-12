@@ -195,6 +195,22 @@ pub struct MerkleMap {
 }
 
 impl MerkleMap {
+    fn checked_variable_payload_len(&self) -> crate::Result<u64> {
+        let sizes = self
+            .variable_block_sizes
+            .as_ref()
+            .ok_or_else(|| Error::C2PAValidation("variable block sizes missing".into()))?;
+        if sizes.is_empty() || sizes.len() != self.count || sizes.iter().any(|s| *s == 0) {
+            return Err(Error::C2PAValidation(
+                "variable block sizes/count are invalid".into(),
+            ));
+        }
+        sizes
+            .iter()
+            .try_fold(0u64, |n, s| n.checked_add(*s))
+            .ok_or_else(|| Error::C2PAValidation("variable block sizes overflow".into()))
+    }
+
     pub fn hash_check(&self, indx: usize, merkle_hash: &[u8]) -> bool {
         if let Some(h) = self.hashes.get(indx) {
             vec_compare(h, merkle_hash)
@@ -536,6 +552,67 @@ impl BmffHash {
             .collect();
 
         self.merkle = Some(merkle_maps);
+        Ok(())
+    }
+
+    /// Stores complete ordered SHA-256 leaf rows with explicit per-mdat sizes.
+    ///
+    /// Payload coverage is checked by stream verification. Unlike the legacy
+    /// fixed injector, this stores the leaf row, so no auxiliary proof boxes
+    /// are required. The caller must hash the unchanged input ranges.
+    pub fn add_mdat_variable_leaf_hashes(
+        &mut self,
+        leaf_hashes: Vec<Vec<Vec<u8>>>,
+        block_sizes: Vec<Vec<u64>>,
+    ) -> crate::Result<()> {
+        if self.bmff_version != 3 || self.alg.as_deref() != Some("sha256") {
+            return Err(Error::BadParam(
+                "variable mdat injection requires BMFF v3 SHA-256".into(),
+            ));
+        }
+        if leaf_hashes.is_empty() || leaf_hashes.len() != block_sizes.len() {
+            return Err(Error::BadParam(
+                "variable mdat map counts differ or are empty".into(),
+            ));
+        }
+        let mut maps = Vec::with_capacity(block_sizes.len());
+        for (index, (hashes, sizes)) in leaf_hashes.into_iter().zip(block_sizes).enumerate() {
+            if hashes.is_empty()
+                || hashes.len() != sizes.len()
+                || hashes.iter().any(|h| h.len() != 32)
+                || sizes.iter().any(|s| *s == 0)
+                || sizes
+                    .iter()
+                    .try_fold(0u64, |n, s| n.checked_add(*s))
+                    .is_none()
+            {
+                return Err(Error::BadParam(
+                    "invalid variable mdat sizes or leaf row".into(),
+                ));
+            }
+            let map = MerkleMap {
+                unique_id: 0,
+                local_id: index,
+                count: hashes.len(),
+                alg: self.alg.clone(),
+                init_hash: None,
+                hashes: VecByteBuf(hashes.into_iter().map(ByteBuf::from).collect()),
+                fixed_block_size: None,
+                variable_block_sizes: Some(sizes),
+            };
+            self.check_merkle_leaf_memory(map.count as u64, &map)?;
+            maps.push(map);
+        }
+        // The flat-hash exclusion is distinct from the actual-payload leaves.
+        if !self.exclusions.iter().any(|e| e.xpath == "/mdat") {
+            let mut mdat = ExclusionsMap::new("/mdat".into());
+            mdat.subset = Some(vec![SubsetMap {
+                offset: 16,
+                length: 0,
+            }]);
+            self.exclusions.push(mdat);
+        }
+        self.merkle = Some(maps);
         Ok(())
     }
 
@@ -2161,11 +2238,10 @@ impl BmffHash {
             .or(self.alg.as_ref())
             .ok_or(Error::BadParam("alg is required".to_string()))?;
 
-        // Per the C2PA spec exclusion list requirements, mdat boxes always exclude exactly 16
-        // bytes from the start regardless of whether the box uses standard (8-byte) or
-        // large-size (16-byte) encoding.  The spec fixes the exclusion at 16 so that a single
-        // xpath expression can cover both encodings; for a standard-size mdat this means the
-        // first 8 bytes of the mdat payload are also excluded.
+        // Pinned implementation limitation: Merkle ranges start at box+16 even
+        // for 8-byte headers. C2PA requires actual-payload tiling; its offset-16
+        // flat-hash exclusion is distinct. The capture GOP experiment rejects
+        // 8-byte headers instead of dropping those payload bytes.
         // saturating_sub guards against underflow when box_info.size() < MDAT_EXCLUSION_SIZE.
         const MDAT_EXCLUSION_SIZE: u64 = 16;
 
@@ -2195,9 +2271,10 @@ impl BmffHash {
         } else if let Some(variable_block_sizes) = &merkle_map.variable_block_sizes {
             let mut block_start = box_info.start().saturating_add(MDAT_EXCLUSION_SIZE);
 
-            // make sure variable_block_sizes == length of the box
+            self.check_merkle_leaf_memory(variable_block_sizes.len() as u64, merkle_map)?;
+            // Check attacker-controlled sizes without overflow or zero-length leaves.
             if box_info.size().saturating_sub(MDAT_EXCLUSION_SIZE)
-                != variable_block_sizes.iter().sum::<u64>()
+                != merkle_map.checked_variable_payload_len()?
             {
                 return Err(Error::C2PAValidation(
                     "variable block sizes do not match box size".to_string(),
@@ -2356,9 +2433,9 @@ impl BmffHash {
             ));
         }
 
-        // Per the C2PA spec exclusion list requirements, mdat boxes always exclude exactly 16
-        // bytes from the start regardless of whether the box uses standard (8-byte) or
-        // large-size (16-byte) encoding.
+        // Pinned implementation limitation, not the normative Merkle payload
+        // rule: ranges start at box+16. Keep legacy fixed behavior unchanged;
+        // capture's explicit GOP layout rejects actual 8-byte mdat headers.
         // saturating_sub guards against underflow when box_info.size() < MDAT_EXCLUSION_SIZE.
         const MDAT_EXCLUSION_SIZE: u64 = 16;
 
@@ -2390,9 +2467,20 @@ impl BmffHash {
             } else if let Some(variable_block_sizes) = &merkle_map.variable_block_sizes {
                 let mut block_start = box_info.start().saturating_add(MDAT_EXCLUSION_SIZE);
 
-                // make sure variable_block_sizes == length of the box
+                if merkle_map.local_id != index {
+                    return Err(Error::C2PAValidation(
+                        "variable mdat localId is not its box index".into(),
+                    ));
+                }
+                // No root-only/no-proof shortcut for variable maps.
+                if c2pa_boxes.bmff_merkle.is_empty() && merkle_map.hashes.len() != merkle_map.count
+                {
+                    return Err(Error::C2PAValidation(
+                        "variable mdat requires a complete leaf row or proofs".into(),
+                    ));
+                }
                 if box_info.size().saturating_sub(MDAT_EXCLUSION_SIZE)
-                    != variable_block_sizes.iter().sum::<u64>()
+                    != merkle_map.checked_variable_payload_len()?
                 {
                     return Err(Error::C2PAValidation(
                         "variable block sizes does not match mdat box size".to_string(),
