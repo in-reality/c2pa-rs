@@ -20,7 +20,6 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 
 use crate::{
     assertions::DataHash,
-    crypto::raw_signature,
     identity::{
         builder::{IdentityAssertionBuilder, IdentityAssertionSigner},
         x509::X509CredentialHolder,
@@ -45,15 +44,12 @@ fn identity_signer() -> IdentityAssertionSigner {
     let (cawg_cert_chain, cawg_private_key) =
         super::fixtures::cert_chain_and_private_key_for_alg(SigningAlg::Ed25519);
 
-    let cawg_raw_signer = raw_signature::signer_from_cert_chain_and_private_key(
-        &cawg_cert_chain,
-        &cawg_private_key,
-        SigningAlg::Ed25519,
-        None,
-    )
-    .unwrap();
+    let cawg_raw_signer =
+        c2pa_raw_crypto::signer_from_private_key(&cawg_private_key, SigningAlg::Ed25519).unwrap();
 
-    let x509_holder = X509CredentialHolder::from_raw_signer(cawg_raw_signer);
+    let cawg_cert_chain_der = crate::crypto::cert_chain_pem_to_der(&cawg_cert_chain).unwrap();
+
+    let x509_holder = X509CredentialHolder::from_raw_signer(cawg_raw_signer, cawg_cert_chain_der);
     c2pa_signer
         .add_identity_assertion(IdentityAssertionBuilder::for_credential_holder(x509_holder));
 
@@ -162,6 +158,7 @@ fn sign_embeddable_includes_identity_assertion() {
 /// assertions, so signing with an [`IdentityAssertionSigner`] must fail loudly
 /// rather than silently emit a manifest without the identity assertion.
 #[test]
+#[allow(deprecated)]
 fn data_hashed_embeddable_rejects_identity_signer() {
     let format = "application/c2pa";
     let signer = identity_signer();

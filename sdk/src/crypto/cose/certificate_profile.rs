@@ -19,6 +19,7 @@ use x509_parser::{
     certificate::{BasicExtension, X509Certificate},
     der_parser::{ber::parse_ber_sequence, oid},
     extensions::ParsedExtension,
+    num_bigint::BigInt,
     oid_registry::Oid,
     x509::{AlgorithmIdentifier, X509Version},
 };
@@ -53,6 +54,29 @@ pub fn check_end_entity_certificate_profile(
 
         CertificateProfileError::InvalidCertificate
     })?;
+
+    // makes sure the certificate has any mandatory EKU values
+    if ctp.has_mandatory_ekus() {
+        if let Ok(Some(BasicExtension { value: eku, .. })) = signcert.extended_key_usage() {
+            if !ctp.verify_mandatory_ekus(eku) {
+                log_item!(
+                    "",
+                    "certificate missing mandatory EKU",
+                    "check_certificate_profile"
+                )
+                .validation_status(SIGNING_CREDENTIAL_INVALID)
+                .failure_no_throw(validation_log, CertificateProfileError::InvalidEku);
+            }
+        } else {
+            log_item!(
+                "",
+                "certificate missing mandatory EKU",
+                "check_certificate_profile"
+            )
+            .validation_status(SIGNING_CREDENTIAL_INVALID)
+            .failure_no_throw(validation_log, CertificateProfileError::InvalidEku);
+        }
+    }
 
     let tbscert = &signcert.tbs_certificate;
 
@@ -152,6 +176,20 @@ pub fn check_certificate_profile(
         }
     }
 
+    // https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.3
+    // The outer signatureAlgorithm MUST match the signed tbsCertificate.signature field.
+    if signcert.tbs_certificate.signature != signcert.signature_algorithm {
+        log_item!(
+            "",
+            "certificate signature algorithm does not match tbsCertificate signature algorithm",
+            "check_certificate_profile"
+        )
+        .validation_status(SIGNING_CREDENTIAL_INVALID)
+        .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
+
+        return Err(CertificateProfileError::InvalidCertificate);
+    }
+
     let cert_alg = &signcert.signature_algorithm.algorithm;
 
     // Certificate must be signed with one of the following algorithms.
@@ -176,6 +214,20 @@ pub fn check_certificate_profile(
         );
 
         return Err(CertificateProfileError::UnsupportedAlgorithm);
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc8410#section-3
+    // Ed25519 spec: "For all of the OIDs, the parameters MUST be absent."
+    if *cert_alg == ED25519_OID && signcert.signature_algorithm.parameters.is_some() {
+        log_item!(
+            "",
+            "certificate Ed25519 signature algorithm parameters must be absent",
+            "check_certificate_profile"
+        )
+        .validation_status(SIGNING_CREDENTIAL_INVALID)
+        .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
+
+        return Err(CertificateProfileError::InvalidCertificate);
     }
 
     // Verify RSA_PSS parameters.
@@ -294,6 +346,20 @@ pub fn check_certificate_profile(
         }
     }
 
+    // https://datatracker.ietf.org/doc/html/rfc8410#section-3
+    // Ed25519 spec: "For all of the OIDs, the parameters MUST be absent."
+    if skpi_alg.algorithm == ED25519_OID && skpi_alg.parameters.is_some() {
+        log_item!(
+            "",
+            "certificate Ed25519 public key parameters must be absent",
+            "check_certificate_profile"
+        )
+        .validation_status(SIGNING_CREDENTIAL_INVALID)
+        .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
+
+        return Err(CertificateProfileError::InvalidCertificate);
+    }
+
     // Check modulus minimum length for RSA & PSS algorithms.
     if skpi_alg.algorithm == RSA_OID || skpi_alg.algorithm == RSASSA_PSS_OID {
         let (_, skpi_ber) = parse_ber_sequence(&pk.subject_public_key.data)
@@ -309,11 +375,26 @@ pub fn check_certificate_profile(
         let modulus = seq[0]
             .as_bigint()
             .map_err(|_| CertificateProfileError::InvalidCertificate)?;
+        let exponent = seq[1]
+            .as_bigint()
+            .map_err(|_| CertificateProfileError::InvalidCertificate)?;
 
         if modulus.bits() < 2048 {
             log_item!(
                 "",
                 "certificate key length too short",
+                "check_certificate_profile"
+            )
+            .validation_status(SIGNING_CREDENTIAL_INVALID)
+            .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
+
+            return Err(CertificateProfileError::InvalidCertificate);
+        }
+
+        if !is_valid_rsa_public_exponent(&exponent) {
+            log_item!(
+                "",
+                "certificate RSA public exponent is invalid",
                 "check_certificate_profile"
             )
             .validation_status(SIGNING_CREDENTIAL_INVALID)
@@ -413,6 +494,13 @@ pub fn check_certificate_profile(
         None => tbscert.is_ca(), // if is not ca it must be present
     };
 
+    // Time-stamping and OCSP signing certificates are valid for exactly one of
+    // those purposes (checked above).
+    let signs_time_stamps_or_ocsp = matches!(
+        tbscert.extended_key_usage(),
+        Ok(Some(BasicExtension { value: eku, .. })) if eku.time_stamping || eku.ocsp_signing
+    );
+
     // Populate needed extension info.
     for e in signcert.extensions() {
         match e.parsed_extension() {
@@ -423,24 +511,36 @@ pub fn check_certificate_profile(
                 ski_good = true;
             }
             ParsedExtension::KeyUsage(ku) => {
-                if ku.digital_signature() {
-                    if ku.key_cert_sign() && !tbscert.is_ca() {
-                        log_item!(
-                            "",
-                            "certificate missing digitalSignature EKU",
-                            "check_certificate_profile"
-                        )
-                        .validation_status(SIGNING_CREDENTIAL_INVALID)
-                        .failure_no_throw(
-                            validation_log,
-                            CertificateProfileError::InvalidCertificate,
-                        );
+                // "The keyCertSign bit shall only be asserted if the cA boolean is
+                // asserted in the Basic Constraints extension."
+                if ku.key_cert_sign() && !tbscert.is_ca() {
+                    log_item!(
+                        "",
+                        "certificate asserts keyCertSign key usage but is not a CA",
+                        "check_certificate_profile"
+                    )
+                    .validation_status(SIGNING_CREDENTIAL_INVALID)
+                    .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
 
-                        return Err(CertificateProfileError::InvalidCertificate);
-                    }
-                    key_usage_good = true;
+                    return Err(CertificateProfileError::InvalidCertificate);
                 }
-                if ku.key_cert_sign() || ku.non_repudiation() {
+
+                // "Certificates used to sign C2PA manifests shall assert the
+                // digitalSignature bit." Time-stamping and OCSP signing certificates
+                // may assert nonRepudiation instead (RFC 3161, section 2.3).
+                if !tbscert.is_ca() && !signs_time_stamps_or_ocsp && !ku.digital_signature() {
+                    log_item!(
+                        "",
+                        "certificate missing digitalSignature key usage",
+                        "check_certificate_profile"
+                    )
+                    .validation_status(SIGNING_CREDENTIAL_INVALID)
+                    .failure_no_throw(validation_log, CertificateProfileError::InvalidCertificate);
+
+                    return Err(CertificateProfileError::InvalidCertificate);
+                }
+
+                if ku.digital_signature() || ku.key_cert_sign() || ku.non_repudiation() {
                     key_usage_good = true;
                 }
 
@@ -556,21 +656,46 @@ const SECP521R1_OID: Oid<'static> = oid!(1.3.132 .0 .35);
 const SECP384R1_OID: Oid<'static> = oid!(1.3.132 .0 .34);
 const PRIME256V1_OID: Oid<'static> = oid!(1.2.840 .10045 .3 .1 .7);
 
+fn is_valid_rsa_public_exponent(exponent: &BigInt) -> bool {
+    exponent >= &BigInt::from(3u32)
+        && exponent
+            .magnitude()
+            .to_u32_digits()
+            .first()
+            .is_some_and(|least_significant| least_significant % 2 == 1)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
     #![allow(clippy::panic)]
     #![allow(clippy::unwrap_used)]
 
+    use rasn::types::Any;
+    use rasn_pkix::Certificate;
     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
     use wasm_bindgen_test::wasm_bindgen_test;
-    use x509_parser::pem::Pem;
+    use x509_parser::{num_bigint::BigInt, pem::Pem};
 
+    use super::is_valid_rsa_public_exponent;
     use crate::{
         crypto::cose::{check_end_entity_certificate_profile, CertificateTrustPolicy},
         status_tracker::StatusTracker,
-        validation_results::validation_codes::SIGNING_CREDENTIAL_EXPIRED,
+        utils::ephemeral_cert::generate_ephemeral_chain,
+        validation_results::validation_codes::{
+            SIGNING_CREDENTIAL_EXPIRED, SIGNING_CREDENTIAL_INVALID,
+        },
     };
+
+    #[test]
+    fn rsa_public_exponent_profile() {
+        assert!(!is_valid_rsa_public_exponent(&BigInt::from(1u32)));
+        assert!(!is_valid_rsa_public_exponent(&BigInt::from(2u32)));
+        assert!(!is_valid_rsa_public_exponent(&BigInt::from(4u32)));
+        assert!(!is_valid_rsa_public_exponent(&BigInt::from(-3)));
+        assert!(is_valid_rsa_public_exponent(&BigInt::from(3u32)));
+        assert!(is_valid_rsa_public_exponent(&BigInt::from(65537u32)));
+    }
 
     #[test]
     #[cfg_attr(
@@ -625,6 +750,224 @@ mod tests {
         check_end_entity_certificate_profile(&es384_cert, &ctp, &mut validation_log, None).unwrap();
         check_end_entity_certificate_profile(&es512_cert, &ctp, &mut validation_log, None).unwrap();
         check_end_entity_certificate_profile(&ps256_cert, &ctp, &mut validation_log, None).unwrap();
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc8410#section-3
+    // Ed25519 spec: "For all of the OIDs, the parameters MUST be absent."
+    #[test]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        wasm_bindgen_test
+    )]
+    fn ed25519_algorithm_parameters_must_be_absent() {
+        let der_null = Any::new(vec![0x05, 0x00]);
+        let ctp = CertificateTrustPolicy::default();
+
+        let chain = generate_ephemeral_chain("ed25519-profile.local").unwrap();
+
+        let mut validation_log = StatusTracker::default();
+        check_end_entity_certificate_profile(&chain.ee_der, &ctp, &mut validation_log, None)
+            .unwrap();
+
+        let assert_rejected = |cert: &Certificate, expected_description: &str| {
+            let der = rasn::der::encode(cert).unwrap();
+            let mut validation_log = StatusTracker::default();
+            assert!(
+                check_end_entity_certificate_profile(&der, &ctp, &mut validation_log, None)
+                    .is_err()
+            );
+            let item = &validation_log.logged_items()[0];
+            assert_eq!(
+                item.validation_status,
+                Some(SIGNING_CREDENTIAL_INVALID.into())
+            );
+            assert_eq!(item.description, expected_description);
+        };
+
+        // Parameters in the subject public key info algorithm.
+        let mut cert: Certificate = rasn::der::decode(&chain.ee_der).unwrap();
+        cert.tbs_certificate
+            .subject_public_key_info
+            .algorithm
+            .parameters = Some(der_null.clone());
+        assert_rejected(
+            &cert,
+            "certificate Ed25519 public key parameters must be absent",
+        );
+
+        // Parameters in both the outer and the signed (tbsCertificate) signature algorithm.
+        let mut cert: Certificate = rasn::der::decode(&chain.ee_der).unwrap();
+        cert.signature_algorithm.parameters = Some(der_null.clone());
+        cert.tbs_certificate.signature.parameters = Some(der_null.clone());
+        assert_rejected(
+            &cert,
+            "certificate Ed25519 signature algorithm parameters must be absent",
+        );
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.3
+    #[test]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        wasm_bindgen_test
+    )]
+    fn signature_algorithm_must_match_tbs_signature() {
+        let der_null = Any::new(vec![0x05, 0x00]);
+        let ctp = CertificateTrustPolicy::default();
+
+        let chain = generate_ephemeral_chain("ed25519-profile.local").unwrap();
+
+        let expected =
+            "certificate signature algorithm does not match tbsCertificate signature algorithm";
+
+        // Parameters only in the outer signature algorithm.
+        let mut cert: Certificate = rasn::der::decode(&chain.ee_der).unwrap();
+        cert.signature_algorithm.parameters = Some(der_null.clone());
+
+        // Parameters only in the signed (tbsCertificate) signature algorithm.
+        let mut cert_inner: Certificate = rasn::der::decode(&chain.ee_der).unwrap();
+        cert_inner.tbs_certificate.signature.parameters = Some(der_null);
+
+        for cert in [cert, cert_inner] {
+            let der = rasn::der::encode(&cert).unwrap();
+            let mut validation_log = StatusTracker::default();
+            assert!(
+                check_end_entity_certificate_profile(&der, &ctp, &mut validation_log, None)
+                    .is_err()
+            );
+            let item = &validation_log.logged_items()[0];
+            assert_eq!(
+                item.validation_status,
+                Some(SIGNING_CREDENTIAL_INVALID.into())
+            );
+            assert_eq!(item.description, expected);
+        }
+    }
+
+    // C2PA Trust Model, Certificate Profiles: "Certificates used to sign C2PA
+    // manifests shall assert the digitalSignature bit. The keyCertSign bit shall
+    // only be asserted if the cA boolean is asserted."
+    #[test]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        wasm_bindgen_test
+    )]
+    fn end_entity_key_usage() {
+        let ctp = CertificateTrustPolicy::default();
+
+        for (cert_pem, expected_description) in [
+            (
+                include_bytes!("../../../tests/fixtures/crypto/cose/ku_keycertsign_not_ca.pub")
+                    .as_slice(),
+                "certificate asserts keyCertSign key usage but is not a CA",
+            ),
+            (
+                include_bytes!("../../../tests/fixtures/crypto/cose/ku_nonrepudiation_only.pub")
+                    .as_slice(),
+                "certificate missing digitalSignature key usage",
+            ),
+        ] {
+            let mut validation_log = StatusTracker::default();
+            assert!(check_end_entity_certificate_profile(
+                &x509_der_from_pem(cert_pem),
+                &ctp,
+                &mut validation_log,
+                None
+            )
+            .is_err());
+
+            let item = &validation_log.logged_items()[0];
+            assert_eq!(
+                item.validation_status,
+                Some(SIGNING_CREDENTIAL_INVALID.into())
+            );
+            assert_eq!(item.description, expected_description);
+        }
+
+        // A time-stamping certificate may assert nonRepudiation without
+        // digitalSignature (RFC 3161, section 2.3).
+        let mut validation_log = StatusTracker::default();
+        check_end_entity_certificate_profile(
+            &x509_der_from_pem(include_bytes!(
+                "../../../tests/fixtures/crypto/cose/ku_nonrepudiation_tsa.pub"
+            )),
+            &ctp,
+            &mut validation_log,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        wasm_bindgen_test
+    )]
+    fn ocsp_signing_allows_nonrepudiation_without_digital_signature() {
+        fn oid(components: &[u32]) -> rasn::types::ObjectIdentifier {
+            rasn::types::ObjectIdentifier::new(components.to_vec()).unwrap()
+        }
+
+        fn extension(cert: &mut Certificate, components: &[u32], value: Vec<u8>) {
+            let id = oid(components);
+            cert.tbs_certificate
+                .extensions
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|extension| extension.extn_id == id)
+                .unwrap()
+                .extn_value = value.into();
+        }
+
+        let chain = generate_ephemeral_chain("ocsp-key-usage.local").unwrap();
+        let mut cert: Certificate = rasn::der::decode(&chain.ee_der).unwrap();
+        // KeyUsage BIT STRING with only nonRepudiation asserted.
+        extension(&mut cert, &[2, 5, 29, 15], vec![0x03, 0x02, 0x06, 0x40]);
+        extension(
+            &mut cert,
+            &[2, 5, 29, 37],
+            rasn::der::encode(&vec![oid(&[1, 3, 6, 1, 5, 5, 7, 3, 9])]).unwrap(),
+        );
+
+        let ctp = CertificateTrustPolicy::default();
+        let mut validation_log = StatusTracker::default();
+        assert_eq!(
+            check_end_entity_certificate_profile(
+                &rasn::der::encode(&cert).unwrap(),
+                &ctp,
+                &mut validation_log,
+                None,
+            ),
+            Ok(())
+        );
+        assert!(validation_log.logged_items().is_empty());
+
+        // The same key usage must still be rejected for manifest signing.
+        extension(
+            &mut cert,
+            &[2, 5, 29, 37],
+            rasn::der::encode(&vec![oid(&[1, 3, 6, 1, 5, 5, 7, 3, 4])]).unwrap(),
+        );
+        let mut validation_log = StatusTracker::default();
+        assert_eq!(
+            check_end_entity_certificate_profile(
+                &rasn::der::encode(&cert).unwrap(),
+                &ctp,
+                &mut validation_log,
+                None,
+            ),
+            Err(super::CertificateProfileError::InvalidCertificate)
+        );
+        let item = &validation_log.logged_items()[0];
+        assert_eq!(
+            item.validation_status,
+            Some(SIGNING_CREDENTIAL_INVALID.into())
+        );
+        assert_eq!(
+            item.description,
+            "certificate missing digitalSignature key usage"
+        );
     }
 
     fn x509_der_from_pem(cert_pem: &[u8]) -> Vec<u8> {
