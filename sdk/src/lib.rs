@@ -307,3 +307,20 @@ pub(crate) use utils::{cbor_types, hash_utils};
 
 #[cfg(not(any(feature = "openssl", feature = "rust_native_crypto")))]
 compile_error!("Either 'openssl' or 'rust_native_crypto' feature must be enabled.");
+
+/// Hash an exact custom CBOR assertion with its actual JUMBF salt.
+///
+/// Uses the same assertion-box encoding as `Builder`, including its description
+/// and salt. This permits a remote claim signer to resolve a detached assertion
+/// against the device-composed claim without changing the claim signing domain.
+/// Replace this narrow fork wrapper when upstream exposes an equivalent API.
+pub fn cbor_assertion_box_hash(
+    label: &str,
+    cbor: &[u8],
+    salt: Option<Vec<u8>>,
+    alg: &str,
+) -> Result<Vec<u8>> {
+    use crate::assertion::AssertionBase;
+    let assertion = assertions::UserCbor::new(label, cbor.to_vec()).to_assertion()?;
+    claim::Claim::calc_assertion_box_hash(label, &assertion, salt, alg)
+}

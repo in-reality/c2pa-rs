@@ -19,6 +19,22 @@ for each.
 
 ---
 
+## Expose exact salted CBOR assertion hashing
+
+**Where:** `sdk/src/lib.rs` (`cbor_assertion_box_hash`).
+
+**What:** Narrow public wrapper over the existing `UserCbor` conversion and
+`Claim::calc_assertion_box_hash`; no new encoder, salt generator or signing path.
+
+**Why:** A remote capture signer must resolve exact public assertion bytes plus
+the actual SDK-selected JUMBF salt against a device-composed claim. The public
+dynamic-assertion callback supplies that salt while preserving normal SDK
+replacement/hash semantics. Upstream 0.91.0/main still keeps this hash helper
+private; upgrading alone does not provide the required API. Remove the wrapper
+when an upstream equivalent is public and preserves the same byte semantics.
+
+---
+
 ## Expose Merkle API
 
 **What:** Public `merkle_utils` module with `compute_merkle_root` /
