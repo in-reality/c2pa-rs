@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout c2pa-rs main
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
 
@@ -49,8 +49,13 @@ jobs:
 
       - name: Build and test
         run: |
-          cargo build --workspace --all-features
-          cargo test --workspace --all-features
+          # Exclude experimental (`unstable_`) features: the canary tracks
+          # integration drift with extracted crates, not experimental code,
+          # which is covered by the non-blocking experimental-features.yml.
+          # See docs/experimental-features.md.
+          FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '[.packages[] | .features | keys[]] | unique | map(select(. != "default" and (startswith("unstable_") | not))) | join(" ")')
+          cargo build --workspace --features "$FEATURES"
+          cargo test --workspace --features "$FEATURES"
 
       - name: Open or update canary issue on failure
         if: failure()

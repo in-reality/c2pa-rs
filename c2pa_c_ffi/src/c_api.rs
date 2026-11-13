@@ -18,8 +18,14 @@ use std::{
 
 // C has no namespace so we prefix things with C2PA to make them unique (as namespace)
 use c2pa::{
-    assertions::DataHash, create_signer, Builder as C2paBuilder, CallbackSigner, Context,
-    ProgressPhase, Reader as C2paReader, Settings as C2paSettings, SigningAlg,
+    assertions::DataHash,
+    create_signer,
+    identity::{
+        builder::{CredentialHolder, IdentityBuilderError},
+        SignerPayload,
+    },
+    Builder as C2paBuilder, CallbackSigner, Context, ProgressPhase, Reader as C2paReader,
+    Settings as C2paSettings, SigningAlg,
 };
 
 #[cfg(test)]
@@ -259,11 +265,40 @@ pub struct C2paSigner {
     pub signer: Box<dyn crate::maybe_send_sync::C2paSignerObject>,
 }
 
-/// Defines a callback to read from a stream.
+/// Defines a callback to sign data.
 ///
 /// # Parameters
-/// * context: A generic context value to used by the C code, often a file or stream reference.
+/// * `context`: an opaque context value supplied to [`c2pa_signer_create`].
+/// * `data`: the bytes to sign.
+/// * `len`: the length of `data` in bytes.
+/// * `signed_bytes`: the buffer in which to write the signature.
+/// * `signed_len`: the capacity of `signed_bytes` in bytes.
+///
+/// # Returns
+/// The number of signature bytes written, which must not exceed `signed_len`, or a negative value
+/// on failure.
 pub type SignerCallback = unsafe extern "C" fn(
+    context: *const (),
+    data: *const c_uchar,
+    len: usize,
+    signed_bytes: *mut c_uchar,
+    signed_len: usize,
+) -> isize;
+
+/// Produces the `signature` field of a CAWG identity assertion for a
+/// credential holder that is not an X.509 certificate (for example an
+/// identity claims aggregation credential obtained from an aggregator).
+///
+/// Called by the SDK during signing, once the referenced assertions are final.
+/// `data` holds the CBOR serialization of the identity assertion's
+/// `signer_payload` (`len` bytes): the same bytes an X.509 holder signs.
+/// The callback writes the signature bytes into `signed_bytes` (capacity
+/// `signed_len`, the `reserve_size` given at creation) and returns the number
+/// of bytes written, or a negative value on failure.
+///
+/// The callback may block (for example on a network request) and must be
+/// safe to call more than once for one signing operation.
+pub type CredentialHolderCallback = unsafe extern "C" fn(
     context: *const (),
     data: *const c_uchar,
     len: usize,
@@ -517,7 +552,8 @@ pub unsafe extern "C" fn c2pa_error_set_last(error_str: *const c_char) -> c_int 
 /// Reads from NULL-terminated C strings.
 #[no_mangle]
 #[deprecated(
-    note = "Use c2pa_settings_new() and c2pa_context_builder_set_settings() to configure a context explicitly."
+    since = "0.79.4",
+    note = "Use `c2pa_settings_new()` and `c2pa_context_builder_set_settings()` to configure a context explicitly. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
 )]
 pub unsafe extern "C" fn c2pa_load_settings(
     settings: *const c_char,
@@ -727,10 +763,9 @@ pub unsafe extern "C" fn c2pa_context_builder_set_signer(
     signer_ptr: *mut C2paSigner,
 ) -> c_int {
     let builder = deref_mut_or_return_int!(builder, C2paContextBuilder);
-    // Untrack the signer before taking ownership via Box::from_raw.
+    // Untrack the signer before taking ownership.
     // This prevents double-free if C code later calls c2pa_signer_free().
-    untrack_or_return_int!(signer_ptr, C2paSigner);
-    let c2pa_signer = Box::from_raw(signer_ptr);
+    let c2pa_signer = untrack_or_return_int!(signer_ptr, C2paSigner);
     let result = builder.set_signer(c2pa_signer.signer);
     ok_or_return_int!(result);
     0
@@ -837,9 +872,8 @@ pub unsafe extern "C" fn c2pa_context_builder_set_http_resolver(
     resolver_ptr: *mut C2paHttpResolver,
 ) -> c_int {
     let builder = deref_mut_or_return_int!(builder, C2paContextBuilder);
-    untrack_or_return_int!(resolver_ptr, C2paHttpResolver);
-    let c2pa_resolver = Box::from_raw(resolver_ptr);
-    let result = builder.set_resolver(*c2pa_resolver);
+    let c2pa_resolver = untrack_or_return_int!(resolver_ptr, C2paHttpResolver);
+    let result = builder.set_resolver(c2pa_resolver);
     ok_or_return_int!(result);
     0
 }
@@ -863,9 +897,8 @@ pub unsafe extern "C" fn c2pa_context_builder_set_http_resolver(
 pub unsafe extern "C" fn c2pa_context_builder_build(
     builder: *mut C2paContextBuilder,
 ) -> *mut C2paContext {
-    untrack_or_return_null!(builder, C2paContextBuilder);
-    let context = Box::from_raw(builder);
-    box_tracked!((*context).into_shared())
+    let context = untrack_or_return_null!(builder, C2paContextBuilder);
+    box_tracked!(context.into_shared())
 }
 
 /// Creates a new immutable context with default settings.
@@ -934,7 +967,10 @@ pub struct C2paSignerInfo {
 /// The string must not have been modified in C.
 /// The string can only be freed once and is invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_release_string(s: *mut c_char) {
     cimpl_free!(s);
 }
@@ -1006,7 +1042,10 @@ pub unsafe extern "C" fn c2pa_free(ptr: *const c_void) -> c_int {
 /// The string must not have been modified in C.
 /// The string can only be freed once and is invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_string_free(s: *mut c_char) {
     cimpl_free!(s);
 }
@@ -1086,7 +1125,8 @@ pub unsafe extern "C" fn c2pa_reader_from_context(context: *mut C2paContext) -> 
 /// stream must be a valid pointer to a C2paStream.
 #[no_mangle]
 #[deprecated(
-    note = "Use c2pa_reader_from_context() with an explicit context instead of relying on thread-local settings."
+    since = "0.79.4",
+    note = "Use `c2pa_reader_from_context()` with an explicit context instead of relying on thread-local settings. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
 )]
 pub unsafe extern "C" fn c2pa_reader_from_stream(
     format: *const c_char,
@@ -1123,14 +1163,16 @@ pub unsafe extern "C" fn c2pa_reader_with_stream(
     format: *const c_char,
     stream: *mut C2paStream,
 ) -> *mut C2paReader {
-    // Validate inputs first, while reader is still tracked
+    // Take ownership of `reader` first: every early return below now drops it via
+    // Rust's ordinary scope-exit `Drop`, so a validation failure here invalidates
+    // `reader` exactly like a failure in `with_stream` itself would -- the caller
+    // never needs to free the passed-in reader themselves, success or failure.
+    let reader = untrack_or_return_null!(reader, C2paReader);
+
     let format = cstr_or_return_null!(format);
     let stream = deref_mut_or_return_null!(stream, C2paStream);
 
-    // Now safe to take ownership - all validations passed
-    untrack_or_return_null!(reader, C2paReader);
-    let reader = Box::from_raw(reader);
-    let reader = ok_or_return_null!((*reader).with_stream(&format, stream));
+    let reader = ok_or_return_null!(reader.with_stream(&format, stream));
     box_tracked!(reader)
 }
 
@@ -1161,19 +1203,16 @@ pub unsafe extern "C" fn c2pa_reader_with_manifest_data_and_stream(
     manifest_data: *const c_uchar,
     manifest_size: usize,
 ) -> *mut C2paReader {
+    // Take ownership of `reader` first so every early return below (ours or
+    // `with_manifest_data_and_stream`'s) drops it uniformly via scope-exit `Drop`.
+    let reader = untrack_or_return_null!(reader, C2paReader);
+
     let format = cstr_or_return_null!(format);
     let stream = deref_mut_or_return_null!(stream, C2paStream);
     let manifest_bytes = bytes_or_return_null!(manifest_data, manifest_size, "manifest_data");
 
-    // Take ownership of the Reader (needs to remove it from tracking to take it)
-    untrack_or_return_null!(reader, C2paReader);
-    let reader = Box::from_raw(reader);
-    let reader = ok_or_return_null!((*reader).with_manifest_data_and_stream(
-        manifest_bytes,
-        &format,
-        stream
-    ));
-    // New reader, will be tracked now too
+    let reader =
+        ok_or_return_null!(reader.with_manifest_data_and_stream(manifest_bytes, &format, stream));
     box_tracked!(reader)
 }
 
@@ -1209,15 +1248,15 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
     stream: *mut C2paStream,
     fragment: *mut C2paStream,
 ) -> *mut C2paReader {
-    // Validate inputs first, while reader is still tracked
+    // Take ownership of `reader` first so every early return below (ours or
+    // `with_fragment`'s) drops it uniformly via scope-exit `Drop`.
+    let reader = untrack_or_return_null!(reader, C2paReader);
+
     let format = cstr_or_return_null!(format);
     let stream = deref_mut_or_return_null!(stream, C2paStream);
     let fragment = deref_mut_or_return_null!(fragment, C2paStream);
 
-    // Now safe to take ownership - all validations passed
-    untrack_or_return_null!(reader, C2paReader);
-    let reader = Box::from_raw(reader);
-    let reader = ok_or_return_null!((*reader).with_fragment(&format, stream, fragment));
+    let reader = ok_or_return_null!(reader.with_fragment(&format, stream, fragment));
     box_tracked!(reader)
 }
 
@@ -1258,7 +1297,8 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
 #[cfg(feature = "file_io")]
 #[no_mangle]
 #[deprecated(
-    note = "Use c2pa_reader_from_context() with an explicit context instead of relying on thread-local settings."
+    since = "0.79.4",
+    note = "Use `c2pa_reader_from_context()` with an explicit context instead of relying on thread-local settings. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
 )]
 #[allow(deprecated)]
 pub unsafe fn c2pa_reader_from_file(path: *const c_char) -> *mut C2paReader {
@@ -1286,7 +1326,8 @@ pub unsafe fn c2pa_reader_from_file(path: *const c_char) -> *mut C2paReader {
 /// and it is no longer valid after that call.
 #[no_mangle]
 #[deprecated(
-    note = "Use c2pa_reader_from_context() then c2pa_reader_with_manifest_data_and_stream() instead."
+    since = "0.79.4",
+    note = "Use `c2pa_reader_from_context()` then `c2pa_reader_with_manifest_data_and_stream()` instead. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
 )]
 pub unsafe extern "C" fn c2pa_reader_from_manifest_data_and_stream(
     format: *const c_char,
@@ -1317,7 +1358,10 @@ pub unsafe extern "C" fn c2pa_reader_from_manifest_data_and_stream(
 /// # Safety
 /// The C2paReader can only be freed once and is invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_reader_free(reader_ptr: *mut C2paReader) {
     cimpl_free!(reader_ptr);
 }
@@ -1457,7 +1501,10 @@ pub unsafe extern "C" fn c2pa_reader_supported_mime_types(
 /// }
 /// ```
 #[no_mangle]
-#[deprecated(note = "Use c2pa_builder_from_context() then c2pa_builder_set_definition() instead.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_builder_from_context()` then `c2pa_builder_set_definition()` instead. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_builder_from_json(manifest_json: *const c_char) -> *mut C2paBuilder {
     let manifest_json = cstr_or_return_null!(manifest_json);
     // Legacy C API: inherits thread-local settings set by c2pa_load_settings.
@@ -1517,7 +1564,10 @@ pub unsafe extern "C" fn c2pa_builder_from_context(context: *mut C2paContext) ->
 /// }
 /// ```
 #[no_mangle]
-#[deprecated(note = "Use c2pa_builder_from_context() then c2pa_builder_with_archive() instead.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_builder_from_context()` then `c2pa_builder_with_archive()` instead. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 #[allow(deprecated)]
 pub unsafe extern "C" fn c2pa_builder_from_archive(stream: *mut C2paStream) -> *mut C2paBuilder {
     let stream = deref_mut_or_return_null!(stream, C2paStream);
@@ -1550,7 +1600,10 @@ pub unsafe extern "C" fn c2pa_builder_supported_mime_types(
 /// # Safety
 /// The C2paBuilder can only be freed once and is invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_builder_free(builder_ptr: *mut C2paBuilder) {
     cimpl_free!(builder_ptr);
 }
@@ -1583,14 +1636,14 @@ pub unsafe extern "C" fn c2pa_builder_with_definition(
     builder: *mut C2paBuilder,
     manifest_json: *const c_char,
 ) -> *mut C2paBuilder {
-    // Validate inputs first, while builder is still tracked
+    // Take ownership of `builder` first so every early return below (ours or
+    // `with_definition`'s) drops it uniformly via scope-exit `Drop`.
+    let builder = untrack_or_return_null!(builder, C2paBuilder);
+
     let manifest_json = cstr_or_return_null!(manifest_json);
 
-    // Now safe to take ownership - all validations passed
-    untrack_or_return_null!(builder, C2paBuilder);
-    let builder = Box::from_raw(builder);
-    let result = (*builder).with_definition(manifest_json);
-    box_tracked!(ok_or_return_null!(result))
+    let builder = ok_or_return_null!(builder.with_definition(manifest_json));
+    box_tracked!(builder)
 }
 
 /// Configures an existing builder with an archive stream.
@@ -1620,14 +1673,14 @@ pub unsafe extern "C" fn c2pa_builder_with_archive(
     builder: *mut C2paBuilder,
     stream: *mut C2paStream,
 ) -> *mut C2paBuilder {
-    // Validate stream first, while builder is still tracked
+    // Take ownership of `builder` first so every early return below (ours or
+    // `with_archive`'s) drops it uniformly via scope-exit `Drop`.
+    let builder = untrack_or_return_null!(builder, C2paBuilder);
+
     let stream = deref_mut_or_return_null!(stream, C2paStream);
 
-    // Now safe to take ownership - stream is valid
-    untrack_or_return_null!(builder, C2paBuilder);
-    let builder = Box::from_raw(builder);
-    let result = (*builder).with_archive(stream);
-    box_tracked!(ok_or_return_null!(result))
+    let builder = ok_or_return_null!(builder.with_archive(stream));
+    box_tracked!(builder)
 }
 
 /// Sets the builder intent on the Builder.
@@ -1704,6 +1757,59 @@ pub unsafe extern "C" fn c2pa_builder_set_remote_url(
     let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
     let remote_url = cstr_or_return_int!(remote_url);
     builder.set_remote_url(&remote_url);
+    0 as c_int
+}
+
+/// Gets the builder's manifest label.
+///
+/// # Parameters
+/// * builder_ptr: pointer to a Builder. The builder is not consumed.
+/// * label_ptr: receives the label, or NULL if none is set.
+///
+/// # Returns
+/// 1 if a label is set, 0 if none, or -1 on error (see c2pa_error).
+///
+/// # Safety
+/// A label returned through `label_ptr` MUST be released by calling c2pa_free.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_label(
+    builder_ptr: *mut C2paBuilder,
+    label_ptr: *mut *mut c_char,
+) -> c_int {
+    ptr_or_return_int!(label_ptr);
+    *label_ptr = std::ptr::null_mut();
+    let builder = deref_or_return_int!(builder_ptr, C2paBuilder);
+    let Some(label) = builder.definition.label.as_deref() else {
+        return 0;
+    };
+    let label_c_string = to_c_string(label.to_owned());
+    if label_c_string.is_null() {
+        return -1;
+    }
+    *label_ptr = label_c_string;
+    1
+}
+
+/// Sets the manifest label to use for the Builder.
+///
+/// # Parameters
+/// * builder_ptr: pointer to a Builder. The builder is not consumed.
+/// * label: the label, copied. The caller may free it immediately after this call.
+///
+/// # Errors
+/// Returns -1 if there were errors, otherwise returns 0.
+/// The error string can be retrieved by calling c2pa_error.
+///
+/// # Safety
+/// Reads from a NULL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_set_label(
+    builder_ptr: *mut C2paBuilder,
+    label: *const c_char,
+) -> c_int {
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let label = cstr_or_return_int!(label);
+    builder.definition.label = Some(label);
     0 as c_int
 }
 
@@ -2077,7 +2183,10 @@ pub unsafe extern "C" fn c2pa_builder_sign_context(
 /// # Safety
 /// The bytes can only be freed once and are invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_uchar) {
     cimpl_free!(manifest_bytes_ptr);
 }
@@ -2100,6 +2209,10 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
 /// If manifest_bytes_ptr is not NULL, the returned value MUST be released by calling c2pa_free
 /// and it is no longer valid after that call.
 #[no_mangle]
+#[deprecated(
+    since = "0.91.0",
+    note = "Use `c2pa_builder_placeholder()` instead, which also supports dynamic assertions (e.g., CAWG identity). Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_builder_data_hashed_placeholder(
     builder_ptr: *mut C2paBuilder,
     reserved_size: usize,
@@ -2109,6 +2222,7 @@ pub unsafe extern "C" fn c2pa_builder_data_hashed_placeholder(
     ptr_or_return_int!(manifest_bytes_ptr);
     let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
     let format = cstr_or_return_int!(format);
+    #[allow(deprecated)]
     let result = builder.data_hashed_placeholder(reserved_size, &format);
     let manifest_bytes = ok_or_return_int!(result);
     let len = manifest_bytes.len() as i64;
@@ -2139,6 +2253,10 @@ pub unsafe extern "C" fn c2pa_builder_data_hashed_placeholder(
 /// If manifest_bytes_ptr is not NULL, the returned value MUST be released by calling c2pa_free
 /// and it is no longer valid after that call.
 #[no_mangle]
+#[deprecated(
+    since = "0.91.0",
+    note = "Use `c2pa_builder_update_hash_from_stream()` and `c2pa_builder_sign_embeddable()` instead. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_builder_sign_data_hashed_embeddable(
     builder_ptr: *mut C2paBuilder,
     signer_ptr: *mut C2paSigner,
@@ -2163,6 +2281,7 @@ pub unsafe extern "C" fn c2pa_builder_sign_data_hashed_embeddable(
             .map_err(Error::from_c2pa_error));
     }
 
+    #[allow(deprecated)]
     let result =
         builder.sign_data_hashed_embeddable(c2pa_signer.signer.as_ref(), &data_hash, &format);
 
@@ -2506,6 +2625,10 @@ pub unsafe extern "C" fn c2pa_builder_update_hash_from_stream(
 /// The returned value MUST be released by calling c2pa_free
 /// and it is no longer valid after that call.
 #[no_mangle]
+#[deprecated(
+    since = "0.91.0",
+    note = "Use `c2pa_builder_compose_manifest()` instead, so custom asset I/O handlers registered on the builder's Context are consulted. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_format_embeddable(
     format: *const c_char,
     manifest_bytes_ptr: *const c_uchar,
@@ -2522,7 +2645,58 @@ pub unsafe extern "C" fn c2pa_format_embeddable(
         "manifest_bytes_ptr"
     );
 
+    // Legacy C API: no Builder/Context available, so only the built-in global registry is used.
+    #[allow(deprecated)]
     let result = c2pa::Builder::composed_manifest(bytes, &format);
+    let result_bytes = ok_or_return_int!(result);
+    let len = result_bytes.len() as i64;
+    if !result_bytes_ptr.is_null() {
+        *result_bytes_ptr = to_c_bytes(result_bytes);
+    }
+    len
+}
+
+/// Convert a binary C2PA manifest into an embeddable version for the given format.
+/// A raw manifest (in application/c2pa format) can be uploaded to the cloud but
+/// it cannot be embedded directly into an asset without extra processing.
+/// This method converts the raw manifest into an embeddable version that can be
+/// embedded into an asset.
+///
+/// # Parameters
+/// * builder_ptr: pointer to a Builder.
+/// * format: pointer to a C string with the mime type or extension.
+/// * manifest_bytes_ptr: pointer to a c_uchar with the raw manifest bytes.
+/// * manifest_bytes_size: the size of the manifest_bytes.
+/// * result_bytes_ptr: pointer to a pointer to a c_uchar to return the embeddable manifest bytes.
+///
+/// # Errors
+/// Returns -1 if there were errors, otherwise returns the size of the result_bytes.
+/// The error string can be retrieved by calling c2pa_error.
+///
+/// # Safety
+/// Reads from NULL-terminated C strings.
+/// The returned value MUST be released by calling c2pa_free
+/// and it is no longer valid after that call.
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_compose_manifest(
+    builder_ptr: *mut C2paBuilder,
+    format: *const c_char,
+    manifest_bytes_ptr: *const c_uchar,
+    manifest_bytes_size: usize,
+    result_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let format = cstr_or_return_int!(format);
+    ptr_or_return_int!(manifest_bytes_ptr);
+    ptr_or_return_int!(result_bytes_ptr);
+
+    let bytes = bytes_or_return_int!(
+        manifest_bytes_ptr,
+        manifest_bytes_size,
+        "manifest_bytes_ptr"
+    );
+
+    let result = builder.compose_manifest(bytes, &format);
     let result_bytes = ok_or_return_int!(result);
     let len = result_bytes.len() as i64;
     if !result_bytes_ptr.is_null() {
@@ -2534,6 +2708,7 @@ pub unsafe extern "C" fn c2pa_format_embeddable(
 /// Creates a C2paSigner from a callback and configuration.
 ///
 /// # Parameters
+/// * context: an opaque context value passed to the callback.
 /// * callback: a callback function to sign data.
 /// * alg: the signing algorithm.
 /// * certs: a pointer to a NULL-terminated string containing the certificate chain in PEM format.
@@ -2551,9 +2726,14 @@ pub unsafe extern "C" fn c2pa_format_embeddable(
 /// enough, possibly being re-used and called multiple times. The callback is logically
 /// owned by the host/caller.
 ///
+/// # Callback contract
+///
+/// Return a negative value to propagate an error on failure. A successful return value must not
+/// exceed the `signed_len` supplied to the callback.
+///
 /// # Example
 /// ```c
-/// auto result = c2pa_signer_create(callback, alg, certs, tsa_url);
+/// auto result = c2pa_signer_create(context, callback, alg, certs, tsa_url);
 /// if (result == NULL) {
 ///     auto error = c2pa_error();
 ///     printf("Error: %s\n", error);
@@ -2577,7 +2757,9 @@ pub unsafe extern "C" fn c2pa_signer_create(
     // the context set on the CallbackSigner closure
     let c_callback = move |context: *const (), data: &[u8]| {
         // we need to guess at a max signed size, the callback must verify this is big enough or fail.
-        let signed_len_max = data.len() * 2;
+        let signed_len_max = data.len().checked_mul(2).ok_or_else(|| {
+            c2pa::Error::BadParam("signer callback buffer length overflow".to_string())
+        })?;
         let mut signed_bytes: Vec<u8> = vec![0; signed_len_max];
         let signed_size = unsafe {
             (callback)(
@@ -2591,7 +2773,13 @@ pub unsafe extern "C" fn c2pa_signer_create(
         if signed_size < 0 {
             return Err(c2pa::Error::CoseSignature); // todo:: return errors from callback
         }
-        signed_bytes.set_len(signed_size as usize);
+        let signed_size = signed_size as usize;
+        if signed_size > signed_len_max {
+            return Err(c2pa::Error::BadParam(format!(
+                "signer callback returned {signed_size} bytes for a buffer with capacity {signed_len_max}"
+            )));
+        }
+        signed_bytes.truncate(signed_size);
         Ok(signed_bytes)
     };
 
@@ -2651,10 +2839,8 @@ pub unsafe extern "C" fn c2pa_identity_signer_create(
     referenced_assertions: *const *const c_char,
     roles: *const *const c_char,
 ) -> *mut C2paSigner {
-    untrack_or_return_null!(c2pa_signer_ptr, C2paSigner);
-    untrack_or_return_null!(identity_signer_ptr, C2paSigner);
-    let c2pa_signer = Box::from_raw(c2pa_signer_ptr);
-    let identity_signer = Box::from_raw(identity_signer_ptr);
+    let c2pa_signer = untrack_or_return_null!(c2pa_signer_ptr, C2paSigner);
+    let identity_signer = untrack_or_return_null!(identity_signer_ptr, C2paSigner);
 
     let referenced_assertions = cstr_array_or_return_null!(referenced_assertions);
     let roles = cstr_array_or_return_null!(roles);
@@ -2665,6 +2851,167 @@ pub unsafe extern "C" fn c2pa_identity_signer_create(
     let signer = create_signer::from_x509_identity(
         Box::new(c2pa_signer.signer),
         Box::new(identity_signer.signer),
+        &refs,
+        &role_refs,
+    );
+
+    box_tracked!(C2paSigner {
+        signer: Box::new(signer),
+    })
+}
+
+/// A [`CredentialHolder`] backed by a C callback.
+struct CallbackCredentialHolder {
+    context: *const (),
+    sig_type: &'static str,
+    reserve_size: usize,
+    callback: CredentialHolderCallback,
+}
+
+// The context pointer is owned by the host, which promises it stays valid and
+// usable from the signing thread for as long as the signer lives (the same
+// contract as `c2pa_signer_create`).
+unsafe impl Send for CallbackCredentialHolder {}
+unsafe impl Sync for CallbackCredentialHolder {}
+
+impl CredentialHolder for CallbackCredentialHolder {
+    fn sig_type(&self) -> &'static str {
+        self.sig_type
+    }
+
+    fn reserve_size(&self) -> usize {
+        self.reserve_size
+    }
+
+    fn sign(&self, signer_payload: &SignerPayload) -> Result<Vec<u8>, IdentityBuilderError> {
+        let mut payload_cbor: Vec<u8> = vec![];
+        c2pa_cbor::to_writer(&mut payload_cbor, signer_payload)
+            .map_err(|e| IdentityBuilderError::CborGenerationError(e.to_string()))?;
+
+        let mut signed_bytes: Vec<u8> = vec![0; self.reserve_size];
+        let signed_size = unsafe {
+            (self.callback)(
+                self.context,
+                payload_cbor.as_ptr(),
+                payload_cbor.len(),
+                signed_bytes.as_mut_ptr(),
+                self.reserve_size,
+            )
+        };
+        if signed_size < 0 {
+            return Err(IdentityBuilderError::SignerError(format!(
+                "credential holder callback failed ({signed_size})"
+            )));
+        }
+        let signed_size = signed_size as usize;
+        if signed_size > self.reserve_size {
+            return Err(IdentityBuilderError::BoxSizeTooSmall);
+        }
+        signed_bytes.truncate(signed_size);
+        Ok(signed_bytes)
+    }
+}
+
+/// Creates a C2paSigner that signs the C2PA claim with an existing [`C2paSigner`] and
+/// embeds one CAWG identity assertion whose `signature` is produced by a callback.
+///
+/// Use this for credential types other than X.509, such as an identity claims
+/// aggregation credential (`sig_type` = `cawg.identity_claims_aggregation`) that an
+/// aggregator issues at signing time. The callback receives the CBOR `signer_payload`
+/// (referenced assertions with their final hashes, `sig_type`, roles) and returns the
+/// bytes to place in the assertion's `signature` field (for an ICA credential: the
+/// COSE_Sign1 over the verifiable credential).
+///
+/// Dynamic assertions already carried by `c2pa_signer` are kept, so a signer from
+/// [`c2pa_identity_signer_create`] can be passed here to emit both the X.509 and the
+/// callback-backed identity assertions.
+///
+/// The input signer is **consumed** by this call: ownership transfers to the returned
+/// signer and the caller MUST NOT free it afterward.
+///
+/// # Parameters
+/// * `c2pa_signer`: A `C2paSigner` used to sign the C2PA claim. Consumed by this call.
+/// * `sig_type`: The identity assertion's `sig_type` (NULL-terminated UTF-8), for example
+///   `cawg.identity_claims_aggregation`.
+/// * `reserve_size`: The maximum size in bytes of the signature the callback will return.
+///   Signing fails if the callback returns more.
+/// * `context`: An opaque pointer passed back to the callback.
+/// * `callback`: The [`CredentialHolderCallback`].
+/// * `referenced_assertions`: A NULL-terminated array of NULL-terminated UTF-8 strings naming
+///   assertions to reference in the identity assertion, or NULL if none. The hard binding
+///   assertion is always referenced.
+/// * `roles`: A NULL-terminated array of NULL-terminated UTF-8 strings specifying the named
+///   actor's roles, or NULL if none.
+///
+/// # Errors
+/// Returns NULL if the signer pointer is NULL, `sig_type` is NULL or empty, or
+/// `reserve_size` is 0; call `c2pa_error` to retrieve the error string. On failure the
+/// input signer is NOT consumed.
+///
+/// # Safety
+/// `c2pa_signer_ptr` must have been created by a `c2pa_signer_*` function and not yet freed.
+/// After a successful call it is invalid — do NOT pass it to `c2pa_free`.
+/// The returned value MUST be released by calling `c2pa_free`.
+/// `sig_type`, `referenced_assertions` and `roles` are read during this call only.
+/// `context` and `callback` must stay valid for as long as the returned signer lives and
+/// may be used from the thread that signs.
+///
+/// # Example
+/// ```c
+/// isize ica_credential(const void* ctx, const unsigned char* payload, size_t len,
+///                      unsigned char* out, size_t out_len) {
+///     // POST payload to the aggregator, copy the COSE_Sign1 it returns into out
+///     ...
+/// }
+/// C2paSigner* c2pa = c2pa_signer_create(c2pa_ctx, c2pa_sign_cb, C2PA_SIGNING_ALG_ES256, c2pa_certs, NULL);
+/// const char* refs[] = { "c2pa.actions", NULL };
+/// C2paSigner* signer = c2pa_identity_signer_create_with_credential_holder(
+///     c2pa, "cawg.identity_claims_aggregation", 8192, my_ctx, ica_credential, refs, NULL);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_identity_signer_create_with_credential_holder(
+    c2pa_signer_ptr: *mut C2paSigner,
+    sig_type: *const c_char,
+    reserve_size: usize,
+    context: *const c_void,
+    callback: CredentialHolderCallback,
+    referenced_assertions: *const *const c_char,
+    roles: *const *const c_char,
+) -> *mut C2paSigner {
+    let sig_type = cstr_or_return_null!(sig_type);
+    if sig_type.is_empty() {
+        CimplError::null_parameter("sig_type (empty)").set_last();
+        return std::ptr::null_mut();
+    }
+    if reserve_size == 0 {
+        CimplError::null_parameter("reserve_size (0)").set_last();
+        return std::ptr::null_mut();
+    }
+    // Every parameter is validated before the signer is consumed, so a failed
+    // call leaves `c2pa_signer_ptr` usable.
+    let referenced_assertions = cstr_array_or_return_null!(referenced_assertions);
+    let roles = cstr_array_or_return_null!(roles);
+    ptr_or_return_null!(c2pa_signer_ptr);
+    let c2pa_signer = untrack_or_return_null!(c2pa_signer_ptr, C2paSigner);
+
+    let refs: Vec<&str> = referenced_assertions.iter().map(|s| s.as_str()).collect();
+    let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
+
+    // `CredentialHolder::sig_type` returns `&'static str`; the value is owned by
+    // the holder for the life of the signer, so leaking one small string per
+    // signer creation is the cost of matching that trait.
+    let sig_type: &'static str = Box::leak(sig_type.into_boxed_str());
+
+    let holder = CallbackCredentialHolder {
+        context: context as *const (),
+        sig_type,
+        reserve_size,
+        callback,
+    };
+
+    let signer = create_signer::from_credential_holder(
+        Box::new(c2pa_signer.signer),
+        Box::new(holder),
         &refs,
         &role_refs,
     );
@@ -2728,7 +3075,8 @@ pub unsafe extern "C" fn c2pa_signer_from_info(signer_info: &C2paSignerInfo) -> 
 /// and it is no longer valid after that call.
 #[no_mangle]
 #[deprecated(
-    note = "Use c2pa_context_builder_set_signer() to configure a signer on a context instead."
+    since = "0.79.4",
+    note = "Use `c2pa_context_builder_set_signer()` to configure a signer on a context instead. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
 )]
 pub unsafe extern "C" fn c2pa_signer_from_settings() -> *mut C2paSigner {
     // Legacy C API: reads signer configuration from thread-local settings (set by c2pa_load_settings).
@@ -2764,7 +3112,10 @@ pub unsafe extern "C" fn c2pa_signer_reserve_size(signer_ptr: *mut C2paSigner) -
 /// # Safety
 /// The C2paSigner can only be freed once and is invalid after this call.
 #[no_mangle]
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_signer_free(signer_ptr: *const C2paSigner) {
     cimpl_free!(signer_ptr);
 }
@@ -2797,7 +3148,10 @@ pub unsafe extern "C" fn c2pa_ed25519_sign(
 ///
 /// # Safety
 /// The signature can only be freed once and is invalid after this call.
-#[deprecated(note = "Use c2pa_free() instead, which works for all pointer types.")]
+#[deprecated(
+    since = "0.79.4",
+    note = "Use `c2pa_free()` instead, which works for all pointer types. Will be removed in 0.92.0 (scheduled for mid-November 2026)."
+)]
 pub unsafe extern "C" fn c2pa_signature_free(signature_ptr: *const u8) {
     cimpl_free!(signature_ptr);
 }
@@ -2841,7 +3195,11 @@ unsafe fn c2pa_mime_types_to_c_array(strs: Vec<String>, count: *mut usize) -> *c
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, io::Seek, panic::catch_unwind};
+    use std::{
+        ffi::{CStr, CString},
+        io::{Read, Seek},
+        panic::catch_unwind,
+    };
 
     use super::*;
     use crate::TestStream;
@@ -3225,6 +3583,112 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
+    fn test_c2pa_builder_signs_with_configured_label() {
+        let image_to_sign = include_bytes!(fixture_path!("IMG_0003.jpg"));
+        let mut source_stream = TestStream::new(image_to_sign.to_vec());
+        let mut dest_stream = TestStream::new(Vec::new());
+        let (signer, builder) = setup_signer_and_builder_for_signing_tests();
+
+        unsafe {
+            c2pa_builder_set_intent(
+                builder,
+                C2paBuilderIntent::Edit,
+                C2paDigitalSourceType::Empty,
+            )
+        };
+        let configured_label =
+            CString::new("urn:c2pa:00000000-0000-4000-8000-000000000000").unwrap();
+        assert_eq!(
+            unsafe { c2pa_builder_set_label(builder, configured_label.as_ptr()) },
+            0
+        );
+
+        let format = CString::new("image/jpeg").unwrap();
+        let mut manifest_bytes_ptr = std::ptr::null();
+        let sign_result = unsafe {
+            c2pa_builder_sign(
+                builder,
+                format.as_ptr(),
+                source_stream.as_ptr(),
+                dest_stream.as_ptr(),
+                signer,
+                &mut manifest_bytes_ptr,
+            )
+        };
+        assert!(
+            sign_result > 0,
+            "signing failed: {:?}",
+            CimplError::last_message()
+        );
+
+        dest_stream.stream_mut().rewind().unwrap();
+        let reader = unsafe { c2pa_reader_from_stream(format.as_ptr(), dest_stream.as_ptr()) };
+        assert!(!reader.is_null());
+        let reader_json_ptr = unsafe { c2pa_reader_json(reader) };
+        assert!(!reader_json_ptr.is_null());
+        let reader_json_str = unsafe { CStr::from_ptr(reader_json_ptr) }.to_owned();
+        unsafe { c2pa_free(reader_json_ptr as *const c_void) };
+        let reader_json: serde_json::Value =
+            serde_json::from_str(reader_json_str.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reader_json["active_manifest"],
+            "urn:c2pa:00000000-0000-4000-8000-000000000000"
+        );
+
+        unsafe {
+            c2pa_manifest_bytes_free(manifest_bytes_ptr);
+            c2pa_free(reader as *mut c_void);
+            c2pa_free(builder as *mut c_void);
+            c2pa_free(signer as *mut c_void);
+        }
+    }
+
+    #[test]
+    fn test_c2pa_builder_archive_roundtrips_configured_label() {
+        let context = unsafe { c2pa_context_new() };
+        let builder = unsafe { c2pa_builder_from_context(context) };
+        assert!(!builder.is_null());
+        let configured_label =
+            CString::new("urn:c2pa:00000000-0000-4000-8000-000000000000").unwrap();
+        assert_eq!(
+            unsafe { c2pa_builder_set_label(builder, configured_label.as_ptr()) },
+            0
+        );
+
+        let mut builder_archive_stream = TestStream::new(Vec::new());
+        let to_archive_result =
+            unsafe { c2pa_builder_to_archive(builder, builder_archive_stream.as_ptr()) };
+        assert_eq!(to_archive_result, 0, "{:?}", CimplError::last_message());
+        unsafe { c2pa_free(builder as *mut c_void) };
+
+        builder_archive_stream.stream_mut().rewind().unwrap();
+        let builder_to_load = unsafe { c2pa_builder_from_context(context) };
+        let loaded_builder =
+            unsafe { c2pa_builder_with_archive(builder_to_load, builder_archive_stream.as_ptr()) };
+        assert!(
+            !loaded_builder.is_null(),
+            "{:?}",
+            CimplError::last_message()
+        );
+
+        let mut label_from_archive: *mut c_char = std::ptr::null_mut();
+        let get_label_result =
+            unsafe { c2pa_builder_label(loaded_builder, &mut label_from_archive) };
+        assert_eq!(get_label_result, 1);
+        assert!(!label_from_archive.is_null());
+        let label_from_archive_owned = unsafe { CStr::from_ptr(label_from_archive) }.to_owned();
+        unsafe { c2pa_free(label_from_archive as *const c_void) };
+        assert_eq!(
+            label_from_archive_owned.to_str().unwrap(),
+            "urn:c2pa:00000000-0000-4000-8000-000000000000"
+        );
+
+        unsafe { c2pa_free(loaded_builder as *mut c_void) };
+        unsafe { c2pa_free(context as *mut c_void) };
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn test_c2pa_builder_no_embed() {
         let manifest_def = CString::new("{}").unwrap();
         let builder = unsafe { c2pa_builder_from_json(manifest_def.as_ptr()) };
@@ -3310,14 +3774,52 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn test_c2pa_reader_from_stream_cawg() {
+        // This fixture's identity claims aggregation (ICA) credential is signed
+        // by a `did:jwk` issuer. ICA issuers are untrusted by default, so we must
+        // add that issuer to `trust.anchors[n].trusted_ica_issuers` for the credential
+        // to be reported as valid. You can do this by adding to the trust list anchors.
+        let builder = unsafe { c2pa_context_builder_new() };
+        let settings = unsafe { c2pa_settings_new() };
+
+        let format = CString::new("json").unwrap();
+        let value = CString::new(
+            r#"{
+                "trust": {
+                    "anchors": [
+                        {
+                            "trust_anchors": "",
+                            "trust_uri": "custom_ica_trust_anchor",
+                            "trust_kind": "cawg",
+                            "trusted_ica_issuers": ["did:jwk:eyJhbGciOiJFZERTQSIsImt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiTXA1LTBlODNuTmdRaGRoQlc4UnNoa2p5OTBzYTFBOUpJemtJdGNEcUN1SSJ9"] 
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let result =
+            unsafe { c2pa_settings_update_from_string(settings, value.as_ptr(), format.as_ptr()) };
+        assert_eq!(result, 0);
+
+        let result = unsafe { c2pa_context_builder_set_settings(builder, settings) };
+        assert_eq!(result, 0);
+
+        let context = unsafe { c2pa_context_builder_build(builder) };
+        assert!(!context.is_null());
+
+        let reader = unsafe { c2pa_reader_from_context(context) };
+        assert!(!reader.is_null());
+
         let source_image = include_bytes!(
             "../../sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/success.jpg"
         );
         let mut stream = TestStream::new(source_image.to_vec());
         let format = CString::new("image/jpeg").unwrap();
-        let reader = unsafe { c2pa_reader_from_stream(format.as_ptr(), stream.as_ptr()) };
-        assert!(!reader.is_null());
-        let json = unsafe { c2pa_reader_json(reader) };
+        let configured_reader =
+            unsafe { c2pa_reader_with_stream(reader, format.as_ptr(), stream.as_ptr()) };
+        assert!(!configured_reader.is_null());
+
+        let json = unsafe { c2pa_reader_json(configured_reader) };
         assert!(!json.is_null());
         let json_str = unsafe { CString::from_raw(json) };
         assert!(json_str.to_str().unwrap().contains("Silly Cats 929"));
@@ -3325,7 +3827,12 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("cawg.ica.credential_valid"));
-        unsafe { c2pa_reader_free(reader) };
+
+        unsafe {
+            c2pa_free(settings as *mut c_void);
+            c2pa_free(context as *mut c_void);
+            c2pa_reader_free(configured_reader);
+        };
     }
 
     #[test]
@@ -3363,9 +3870,10 @@ mod tests {
             unsafe { c2pa_reader_with_stream(reader, format.as_ptr(), stream.as_ptr()) };
         assert!(!configured_reader.is_null());
 
-        // Verify consumed reader is no longer tracked
-        let free_result = unsafe { c2pa_free(reader as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `reader` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         // Verify we can read the manifest
         let json = unsafe { c2pa_reader_json(configured_reader) };
@@ -3446,9 +3954,10 @@ mod tests {
             "Reader should be configured with manifest data and stream"
         );
 
-        // Verify the original reader was consumed
-        let free_result = unsafe { c2pa_free(reader as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `reader` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         // Verify we can read the manifest
         let json = unsafe { c2pa_reader_json(configured_reader) };
@@ -3609,6 +4118,101 @@ mod tests {
             }
         })
         .is_ok());
+    }
+
+    fn sign_with_callback(callback: SignerCallback, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+        let certs = include_str!(fixture_path!("certs/ed25519.pub"));
+        let certs_cstr = CString::new(certs).unwrap();
+        let signer_ptr = unsafe {
+            c2pa_signer_create(
+                std::ptr::null(),
+                callback,
+                C2paSigningAlg::Ed25519,
+                certs_cstr.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!signer_ptr.is_null());
+
+        let result = unsafe { &*signer_ptr }.signer.sign(data);
+
+        assert_eq!(unsafe { c2pa_free(signer_ptr as *const c_void) }, 0);
+        result
+    }
+
+    #[test]
+    fn test_callback_signer_rejects_negative_size() {
+        extern "C" fn callback(
+            _context: *const (),
+            _data: *const c_uchar,
+            _len: usize,
+            _signed_bytes: *mut c_uchar,
+            _signed_len: usize,
+        ) -> isize {
+            -1
+        }
+
+        assert!(matches!(
+            sign_with_callback(callback, b"test"),
+            Err(c2pa::Error::CoseSignature)
+        ));
+    }
+
+    #[test]
+    fn test_callback_signer_accepts_exact_capacity() {
+        extern "C" fn callback(
+            _context: *const (),
+            _data: *const c_uchar,
+            _len: usize,
+            signed_bytes: *mut c_uchar,
+            signed_len: usize,
+        ) -> isize {
+            unsafe { std::ptr::write_bytes(signed_bytes, 0xa5, signed_len) };
+            signed_len.try_into().expect("test buffer fits in isize")
+        }
+
+        let signature = sign_with_callback(callback, b"test").expect("exact capacity is valid");
+        assert_eq!(signature, vec![0xa5; 8]);
+    }
+
+    #[test]
+    fn test_callback_signer_rejects_capacity_plus_one() {
+        extern "C" fn callback(
+            _context: *const (),
+            _data: *const c_uchar,
+            _len: usize,
+            _signed_bytes: *mut c_uchar,
+            signed_len: usize,
+        ) -> isize {
+            (signed_len + 1)
+                .try_into()
+                .expect("test buffer fits in isize")
+        }
+
+        let err = sign_with_callback(callback, b"test").unwrap_err();
+        assert!(
+            matches!(&err, c2pa::Error::BadParam(message) if message.contains("returned 9 bytes") && message.contains("capacity 8")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_callback_signer_rejects_isize_max_size() {
+        extern "C" fn callback(
+            _context: *const (),
+            _data: *const c_uchar,
+            _len: usize,
+            _signed_bytes: *mut c_uchar,
+            _signed_len: usize,
+        ) -> isize {
+            isize::MAX
+        }
+
+        let err = sign_with_callback(callback, b"test").unwrap_err();
+        assert!(
+            matches!(&err, c2pa::Error::BadParam(message) if message.contains("capacity 8")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -3787,7 +4391,7 @@ mod tests {
     #[allow(deprecated)]
     fn test_reader_from_file_cawg_identity() {
         let settings = CString::new(include_bytes!(
-            "../../cli/tests/fixtures/trust/cawg_test_settings.toml"
+            "../tests/fixtures/trust/cawg_test_settings.toml"
         ))
         .unwrap();
         let format = CString::new("toml").unwrap();
@@ -4004,9 +4608,10 @@ verify_after_sign = true
         let context = unsafe { c2pa_context_builder_build(builder) };
         assert!(!context.is_null());
 
-        // Verify consumed builder is no longer tracked
-        let free_result = unsafe { c2pa_free(builder as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `builder` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         unsafe {
             c2pa_free(settings as *mut c_void);
@@ -4199,6 +4804,7 @@ verify_after_sign = true
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_c2pa_format_embeddable() {
         // This function requires manifest bytes, which is complex to set up.
         // For now, test with minimal setup to verify it doesn't crash
@@ -4265,9 +4871,10 @@ verify_after_sign = true
         let new_builder = unsafe { c2pa_builder_with_definition(builder, new_manifest.as_ptr()) };
         assert!(!new_builder.is_null(), "Should return new builder");
 
-        // Verify consumed builder is no longer tracked
-        let free_result = unsafe { c2pa_free(builder as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `builder` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         unsafe {
             c2pa_free(new_builder as *mut c_void);
@@ -4282,16 +4889,16 @@ verify_after_sign = true
         let builder = unsafe { c2pa_builder_from_json(manifest_def.as_ptr()) };
         assert!(!builder.is_null());
 
-        // Test with null JSON: returns null, but the builder is not consumed!
+        // Test with null JSON: returns null, and the builder IS consumed -- the
+        // pointer becomes invalid on any failure, not just on success. (We don't
+        // verify this by freeing `builder` here: in a parallel test binary another
+        // thread can reallocate that exact address in the meantime, making such a
+        // check inherently unreliable.)
         let new_builder = unsafe { c2pa_builder_with_definition(builder, std::ptr::null()) };
         assert!(
             new_builder.is_null(),
             "Should return null for invalid input"
         );
-
-        // Builder is still tracked because validation failed before consumption
-        let free_result = unsafe { c2pa_free(builder as *mut c_void) };
-        assert_eq!(free_result, 0);
     }
 
     #[test]
@@ -4309,9 +4916,10 @@ verify_after_sign = true
         // Add archive to builder (this consumes the builder and returns a new one)
         let new_builder = unsafe { c2pa_builder_with_archive(builder, archive_stream.as_ptr()) };
 
-        // Verify consumed builder is no longer tracked
-        let free_result = unsafe { c2pa_free(builder as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `builder` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         if !new_builder.is_null() {
             unsafe {
@@ -4328,16 +4936,16 @@ verify_after_sign = true
         let builder = unsafe { c2pa_builder_from_json(manifest_def.as_ptr()) };
         assert!(!builder.is_null());
 
-        // Test with null stream: returns null, but the builder is NOT consumed
+        // Test with null stream: returns null, and the builder IS consumed -- the
+        // pointer becomes invalid on any failure, not just on success. (We don't
+        // verify this by freeing `builder` here: in a parallel test binary another
+        // thread can reallocate that exact address in the meantime, making such a
+        // check inherently unreliable.)
         let new_builder = unsafe { c2pa_builder_with_archive(builder, std::ptr::null_mut()) };
         assert!(
             new_builder.is_null(),
             "Should return null for invalid stream"
         );
-
-        // Builder is still tracked because validation failed before consumption
-        let free_result = unsafe { c2pa_free(builder as *mut c_void) };
-        assert_eq!(free_result, 0);
     }
 
     #[test]
@@ -4366,9 +4974,10 @@ verify_after_sign = true
             )
         };
 
-        // Verify consumed reader is no longer tracked
-        let free_result = unsafe { c2pa_free(reader as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `reader` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         if !new_reader.is_null() {
             unsafe {
@@ -4391,7 +5000,11 @@ verify_after_sign = true
         let mut fragment_stream = TestStream::new(source_image.to_vec());
         let mut main_stream = TestStream::new(source_image.to_vec());
 
-        // Test with null format: returns null, but the reader is NOT consumed
+        // Test with null format: returns null, and the reader IS consumed -- the
+        // pointer becomes invalid on any failure, not just on success. (We don't
+        // verify this by freeing `reader` here: in a parallel test binary another
+        // thread can reallocate that exact address in the meantime, making such a
+        // check inherently unreliable.)
         let new_reader = unsafe {
             c2pa_reader_with_fragment(
                 reader,
@@ -4404,10 +5017,6 @@ verify_after_sign = true
             new_reader.is_null(),
             "Should return null for invalid format"
         );
-
-        // Reader is still tracked because validation failed before consumption
-        let free_result = unsafe { c2pa_free(reader as *const c_void) };
-        assert_eq!(free_result, 0);
     }
 
     // ========== High-Value Coverage Tests ==========
@@ -4947,7 +5556,7 @@ verify_after_sign = true
         // Supply a single dummy SHA-256 leaf hash for one mdat box (1 chunk).
         // The Merkle leaves is derived from these; the video will not validate but
         // this exercises the full C API call path.
-        let leaf_data: [u8; 4096] = [0xab; 4096];
+        let leaf_data: Vec<u8> = vec![0xab; 4096];
         let result = unsafe {
             c2pa_builder_hash_mdat_bytes(builder, 0, leaf_data.as_ptr(), leaf_data.len(), true)
         };
@@ -5000,9 +5609,10 @@ verify_after_sign = true
         let result = unsafe { c2pa_context_builder_set_signer(builder, signer) };
         assert_eq!(result, 0);
 
-        // Verify the signer is consumed: freeing it should fail cleanly (-1)
-        let free_result = unsafe { c2pa_free(signer as *const c_void) };
-        assert_eq!(free_result, -1);
+        // Note: we don't verify that `signer` is untracked by freeing it here. In a
+        // parallel test binary, another thread can allocate a new tracked pointer at
+        // that exact (now-freed) address between this call returning and any check
+        // we'd run, making such a check inherently unreliable.
 
         let context = unsafe { c2pa_context_builder_build(builder) };
         assert!(!context.is_null());
@@ -5269,6 +5879,257 @@ verify_after_sign = true
             c2pa_signer_free(combined);
             c2pa_reader_free(reader);
         }
+    }
+
+    /// The credential holder callback used by the tests below: records the
+    /// `signer_payload` CBOR it was handed and returns a recognizable signature.
+    static HOLDER_CALLS: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn test_credential_holder(
+        context: *const (),
+        data: *const c_uchar,
+        len: usize,
+        signed_bytes: *mut c_uchar,
+        signed_len: usize,
+    ) -> isize {
+        let payload = safe_slice_from_raw_parts(data, len, "data")
+            .unwrap()
+            .to_vec();
+        HOLDER_CALLS.lock().unwrap().push(payload);
+        let marker: &[u8] = unsafe { &*(context as *const &[u8]) };
+        if marker.len() > signed_len {
+            return -1;
+        }
+        std::ptr::copy_nonoverlapping(marker.as_ptr(), signed_bytes, marker.len());
+        marker.len() as isize
+    }
+
+    /// Sign with a signer that carries BOTH an X.509 identity assertion and a
+    /// callback-backed one, and check that the callback saw a `signer_payload`
+    /// with its `sig_type` and the hard binding, that its bytes landed in the
+    /// second `cawg.identity` assertion, and that the manifest reads back.
+    #[test]
+    #[allow(deprecated)]
+    fn test_c2pa_identity_signer_create_with_credential_holder() {
+        let source_image = include_bytes!(fixture_path!("IMG_0003.jpg"));
+        let mut source_stream = TestStream::new(source_image.to_vec());
+        let mut dest_stream = TestStream::new(Vec::new());
+
+        let make_signer = || {
+            let certs = include_str!(fixture_path!("certs/ed25519.pub"));
+            let private_key = include_bytes!(fixture_path!("certs/ed25519.pem"));
+            let alg = CString::new("Ed25519").unwrap();
+            let sign_cert = CString::new(certs).unwrap();
+            let private_key = CString::new(private_key).unwrap();
+            let signer_info = C2paSignerInfo {
+                alg: alg.as_ptr(),
+                sign_cert: sign_cert.as_ptr(),
+                private_key: private_key.as_ptr(),
+                ta_url: std::ptr::null(),
+            };
+            let signer = unsafe { c2pa_signer_from_info(&signer_info) };
+            assert!(!signer.is_null());
+            signer
+        };
+
+        let ref_c2pa_actions = CString::new("c2pa.actions").unwrap();
+        let refs: [*const c_char; 2] = [ref_c2pa_actions.as_ptr(), std::ptr::null()];
+        let role_creator = CString::new("cawg.creator").unwrap();
+        let roles: [*const c_char; 2] = [role_creator.as_ptr(), std::ptr::null()];
+        let no_roles: [*const c_char; 1] = [std::ptr::null()];
+
+        // X.509 identity signer first, then the callback holder on top of it.
+        let x509 = unsafe {
+            c2pa_identity_signer_create(
+                make_signer(),
+                make_signer(),
+                refs.as_ptr(),
+                no_roles.as_ptr(),
+            )
+        };
+        assert!(!x509.is_null());
+
+        let marker: &[u8] = b"CALLBACK-CREDENTIAL-SIGNATURE";
+        let sig_type = CString::new("INVALID.identity.c_callback").unwrap();
+        HOLDER_CALLS.lock().unwrap().clear();
+        let combined = unsafe {
+            c2pa_identity_signer_create_with_credential_holder(
+                x509,
+                sig_type.as_ptr(),
+                256,
+                &marker as *const &[u8] as *const c_void,
+                test_credential_holder,
+                refs.as_ptr(),
+                roles.as_ptr(),
+            )
+        };
+        assert!(
+            !combined.is_null(),
+            "c2pa_identity_signer_create_with_credential_holder returned NULL: {:?}",
+            CimplError::last_message()
+        );
+
+        let manifest_def = CString::new(
+            serde_json::json!({
+                "assertions": [{
+                    "label": "c2pa.actions",
+                    "data": {
+                        "actions": [{
+                            "action": "c2pa.created",
+                            "digitalSourceType": "http://c2pa.org/digitalsourcetype/empty"
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let builder = unsafe { c2pa_builder_from_json(manifest_def.as_ptr()) };
+        assert!(!builder.is_null());
+
+        let format = CString::new("image/jpeg").unwrap();
+        let mut manifest_bytes_ptr = std::ptr::null();
+        let result = unsafe {
+            c2pa_builder_sign(
+                builder,
+                format.as_ptr(),
+                source_stream.as_ptr(),
+                dest_stream.as_ptr(),
+                combined,
+                &mut manifest_bytes_ptr,
+            )
+        };
+        assert!(
+            result > 0,
+            "signing failed (result={}): {:?}",
+            result,
+            CimplError::last_message()
+        );
+        unsafe { c2pa_free(manifest_bytes_ptr as *const c_void) };
+
+        // The callback saw a signer_payload carrying its sig_type, role and the hard binding.
+        let calls = HOLDER_CALLS.lock().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "credential holder callback was never called"
+        );
+        let payload: c2pa::identity::SignerPayload =
+            c2pa_cbor::from_slice(calls.last().unwrap()).unwrap();
+        assert_eq!(payload.sig_type, "INVALID.identity.c_callback");
+        assert_eq!(payload.roles, vec!["cawg.creator".to_string()]);
+        assert!(payload
+            .referenced_assertions
+            .iter()
+            .any(|a| a.url().contains("c2pa.assertions/c2pa.hash.")));
+        drop(calls);
+
+        // Read back: two identity assertions, the second carrying the callback's bytes.
+        dest_stream.stream_mut().rewind().unwrap();
+        let reader = unsafe { c2pa_reader_from_stream(format.as_ptr(), dest_stream.as_ptr()) };
+        assert!(
+            !reader.is_null(),
+            "reader creation failed: {:?}",
+            CimplError::last_message()
+        );
+        let json_ptr = unsafe { c2pa_reader_json(reader) };
+        assert!(!json_ptr.is_null());
+        let json_str = unsafe { CString::from_raw(json_ptr) };
+        let json = json_str.to_str().unwrap();
+        assert!(
+            json.contains("\"cawg.identity\""),
+            "missing first identity assertion"
+        );
+        assert!(
+            json.contains("cawg.identity__1"),
+            "missing second identity assertion: {json}"
+        );
+        assert!(
+            json.contains("INVALID.identity.c_callback"),
+            "callback sig_type not in manifest: {json}"
+        );
+
+        dest_stream.stream_mut().rewind().unwrap();
+        let mut signed: Vec<u8> = Vec::new();
+        dest_stream.stream_mut().read_to_end(&mut signed).unwrap();
+        assert!(
+            signed.windows(marker.len()).any(|w| w == marker),
+            "callback signature bytes not embedded"
+        );
+
+        unsafe {
+            c2pa_free(builder as *const c_void);
+            c2pa_free(combined as *const c_void);
+            c2pa_free(reader as *const c_void);
+        }
+    }
+
+    /// NULL signer, empty sig_type and zero reserve size are refused with an error set.
+    #[test]
+    fn test_c2pa_identity_signer_create_with_credential_holder_bad_params() {
+        let refs: [*const c_char; 1] = [std::ptr::null()];
+        let sig_type = CString::new("cawg.identity_claims_aggregation").unwrap();
+        let empty = CString::new("").unwrap();
+        let marker: &[u8] = b"";
+
+        let result = unsafe {
+            c2pa_identity_signer_create_with_credential_holder(
+                std::ptr::null_mut(),
+                sig_type.as_ptr(),
+                256,
+                &marker as *const &[u8] as *const c_void,
+                test_credential_holder,
+                refs.as_ptr(),
+                refs.as_ptr(),
+            )
+        };
+        assert!(result.is_null(), "expected NULL for null c2pa_signer_ptr");
+        let error = unsafe { c2pa_error() };
+        assert!(!error.is_null());
+        let _ = unsafe { CString::from_raw(error) };
+
+        let certs = include_str!(fixture_path!("certs/ed25519.pub"));
+        let private_key = include_bytes!(fixture_path!("certs/ed25519.pem"));
+        let alg = CString::new("Ed25519").unwrap();
+        let sign_cert = CString::new(certs).unwrap();
+        let private_key = CString::new(private_key).unwrap();
+        let signer_info = C2paSignerInfo {
+            alg: alg.as_ptr(),
+            sign_cert: sign_cert.as_ptr(),
+            private_key: private_key.as_ptr(),
+            ta_url: std::ptr::null(),
+        };
+        let signer = unsafe { c2pa_signer_from_info(&signer_info) };
+        assert!(!signer.is_null());
+        let result = unsafe {
+            c2pa_identity_signer_create_with_credential_holder(
+                signer,
+                empty.as_ptr(),
+                256,
+                &marker as *const &[u8] as *const c_void,
+                test_credential_holder,
+                refs.as_ptr(),
+                refs.as_ptr(),
+            )
+        };
+        assert!(result.is_null(), "expected NULL for empty sig_type");
+        let error = unsafe { CString::from_raw(c2pa_error()) };
+        assert!(error.to_str().unwrap().contains("sig_type"));
+        // The signer was NOT consumed by the failed call.
+        let result = unsafe {
+            c2pa_identity_signer_create_with_credential_holder(
+                signer,
+                sig_type.as_ptr(),
+                0,
+                &marker as *const &[u8] as *const c_void,
+                test_credential_holder,
+                refs.as_ptr(),
+                refs.as_ptr(),
+            )
+        };
+        assert!(result.is_null(), "expected NULL for reserve_size 0");
+        let error = unsafe { CString::from_raw(c2pa_error()) };
+        assert!(error.to_str().unwrap().contains("reserve_size"));
+        unsafe { c2pa_free(signer as *const c_void) };
     }
 
     /// Verify that `c2pa_identity_signer_create` fails gracefully when either

@@ -4,16 +4,23 @@ This document lists all changes made in this fork compared to upstream
 [contentauth/c2pa-rs](https://github.com/contentauth/c2pa-rs), and the reason
 for each.
 
-**Sync point:** upstream tag `c2pa-v0.90.19` (2026-09-04), merged 2026-09-08.
+**Upstream base:** tag `c2pa-v0.91.11` (2026-11-04), commit
+`7bb32d67b984af5cff064ead2a3a538e696ef70d` on the maintained stable release
+line. Its binary release is marked pre-release under upstream's pre-1.0
+library-release convention. The old 0.90.19 line and this stable line diverged;
+the forward merge preserves the selected release's Claim/Store module layout
+and upstream security fixes, with only the project additions described below.
+Raw signing implementations now come from upstream `c2pa_raw_crypto` 0.3;
+there is no private certificate-validation backport.
 
 ---
 
 ## Certificate trust type fix
 
-**Where:** `sdk/src/crypto/raw_signature/openssl/check_certificate_trust.rs`
+**Where:** `sdk/src/crypto/cose/certificate_trust/openssl.rs`
 
-**Change:** `verify_param.set_time(st.try_into().unwrap())` instead of
-`set_time(st)`.
+**Change:** `verify_param.set_time(st as _)` adapts the epoch to the platform
+OpenSSL time type. The old raw-signature module is removed, as upstream requires.
 
 **Why:** Rust type mismatch when building for `i686-linux-android`.
 
@@ -57,9 +64,10 @@ flat hash and Merkle roots the signer will embed.
 
 ## Builder: pre-injected BMFF Merkle leaves
 
-**What:** `Builder::set_bmff_mdat_hashes`, plus supporting methods on
-`BmffHash` (`add_merkle_placeholder`, `add_mdat_leaf_hashes`,
-`add_place_holder_hash`).
+**What:** `Builder::set_bmff_mdat_hashes` delegates to the selected release's
+`BmffHash::add_mdat_leaf_hashes`. The existing upstream Merkle construction and
+ordered-mdat/proof validation remain authoritative; those supporting methods
+are not a second local implementation.
 
 **Why:** Capture injects Merkle leaves from a single pass over the input
 stream before `sign_file`.
@@ -68,26 +76,63 @@ stream before `sign_file`.
 
 ## Builder: created assertions
 
-**What:** `Builder::add_created_assertion` / `add_created_assertion_json`.
+**What:** `Builder::add_created_assertion` / `add_created_assertion_json`
+delegate to upstream's existing `add_assertion_impl` with `created = true`.
 
 **Why:** Claims V2 signer-attributed assertions for distributed capture paths.
 
 ---
 
+## Experimental BMFF v3 variable mdat leaf rows (t2075)
+
+**Where:** `sdk/src/builder.rs`, `sdk/src/assertions/bmff_hash.rs`,
+`sdk/tests/bmff_gop_leaves.rs`.
+
+**What:** `Builder::set_bmff_mdat_variable_hashes` delegates to
+`BmffHash::add_mdat_variable_leaf_hashes` to serialize complete ordered
+SHA-256 leaf rows and positive, checked `variableBlockSizes`. Counts, sizes,
+row lengths and physical mdat indices are checked by the real stream verifier;
+variable maps without auxiliary proofs require the full leaf row. Per-mdat
+range lookup uses physical indices rather than unordered map iteration.
+Tree/digest algorithms are unchanged. One/odd/even rows, individual leaf
+tampering and malformed serialized maps have focused regression coverage.
+
+**Why:** The isolated Android/common capture experiment needs exact full-payload
+GOP byte ranges without pre-sign remuxing. Roots are computed separately, never
+serialized as a nonstandard field or substituted for a multi-leaf row.
+
+**Limits:** The pinned Merkle range implementation still starts at box+16,
+which differs from C2PA's actual-payload rule for 8-byte mdat headers; the
+capture experiment explicitly rejects those headers. This offset must not be
+explained by the distinct offset-16 flat-hash exclusion. The existing fixed
+injector/root-only verifier remains available unchanged; preserving it is not
+independent proof that its root-only/no-auxiliary-proof representation complies
+with the C2PA standard. No platform qualification, production activation or
+manifest-lane integration is implied by this isolated change.
+
+---
+
 ## Builder: dynamic assertion finalization in sign_embeddable
 
-**What:** Finalize dynamic assertions before `sign_manifest` in
-`sign_embeddable` (consume-once signers such as CAWG identity).
+**What:** Capture dynamic assertions once in `sign_embeddable`, reserve their
+slots, and pass that same list to a crate-private Store signing delegate.
+The maintained Store writer remains the sole content finalizer.
 
-**Why:** Upstream defers finalization to `sign_manifest`, which re-fetches
-dynamic assertions and ships zero placeholders for consume-once signers.
+**Why:** A getter may consume its list, while maintained CAWG signers return
+shared or fresh assertions on each call. Re-fetching loses the former;
+pre-finalizing and invoking the Store writer signs the latter twice.
+The captured-list handoff avoids duplicate key/KMS operations without changing
+the normal Store entry or certificate policy.
 
 ---
 
 ## Store: BMFF flat hash after embed with pre-injected leaves
 
+**Where:** `sdk/src/store/store_io.rs`; the old monolithic `store.rs` is removed.
+
 **What:** Always recompute BMFF flat hash post-embed when a BmffHash assertion
-is present (removed `needs_hash` gate).
+is present (removed `needs_hash` gate). Dynamic finalization visibility lives in
+the selected `store/store_core.rs` module.
 
 **Why:** Pre-populated Merkle leaves from `set_bmff_mdat_hashes` must get
 post-embed binding verification.
@@ -103,11 +148,18 @@ from manifest store bytes synchronously; upstream removed the sync API.
 
 ---
 
-## Dropped (absorbed by upstream 0.90.19)
+## Superseded local changes
 
-- Android `i686` type fix — retained; upstream still uses bare `set_time(st)`.
-- BMFF integer-overflow / underflow hardening — upstream merged equivalent fixes.
-- Ingredient label collision handling — upstream #2585.
+- The ZIP dependency pin and entry-name compatibility workaround are replaced by
+  upstream's ZIP 9.3-compatible dependency and implementation. Resolved compatible
+  dependency versions remain in each consumer lock.
+- BMFF integer-overflow / underflow hardening and ingredient label collisions
+  were already absorbed upstream. The selected release's later BMFF proof-order
+  and payload-pairing hardening is preserved.
+- The old Claim, Store and raw-signature module files stay deleted. Required
+  project behavior is carried into the selected module locations rather than
+  restoring obsolete upstream implementations.
+- The Android `i686` time-type adaptation remains local at its new path above.
 
 ---
 
@@ -131,9 +183,11 @@ No store parsing, signature/trust semantics, or original-media limits change.
 
 ## Current per-claim validation sideband
 
-**Where:** `sdk/src/manifest.rs`.
+**Where:** `sdk/src/manifest.rs` and `sdk/src/reader.rs`.
 
-**What:** Reader manifests serialize `validation_status` failures from the
+**What:** `Reader::current_validation_status` retains the current read's statuses
+before historical ingredient de-duplication and is skipped by serialization.
+Reader manifests serialize `validation_status` failures from the
 current StatusTracker, attributed by claim URI/label before delta de-duplication.
 A present empty list means current signature validation observed no failures;
 an absent field means no current signature validation/failure was observed.
@@ -183,3 +237,42 @@ missing labels/unavailable hashes and adds no validation success or trust claim.
 its embedded store. Callers need to recognize an actual same-label claim conflict
 without rejecting equivalent governing claims for different surrounding closure
 or store padding, or reimplementing SDK identity semantics.
+
+
+---
+
+## Imported signed-history preservation and bounded store decoding
+
+**Where:** `sdk/src/claim/claim_core.rs`, `sdk/src/store/store_core.rs`, and
+`src/settings/mod.rs`.
+
+**What:** An imported, uncompressed manifest retains its exact JUMBF box bytes
+alongside a fingerprint of the SDK's normalized reconstruction. Serialization
+and manifest/signature box hashing reuse those original bytes only while the
+fingerprint still matches; a changed claim or signature takes the normal SDK
+path. Importing a governing ingredient retains earlier inactive manifests in
+their original byte order. The optional aggregate decoded-store cap counts
+all manifest output, including inactive compressed boxes and trailing decoded
+bytes, before materializing claims. The default remains unbounded at the
+aggregate level, with the existing per-manifest limit unchanged.
+
+**Why:** LinkedIn preparation must preserve signed prior history and media bytes
+without accepting a stale raw cache after mutation. The opt-in aggregate cap
+bounds imported credential decoding before an oversized store allocates memory.
+The maintained 0.91.11 module layout and its separate manifest/TSA trust policy
+remain in force. Focused tests live in `sdk/src/store/linkedin_test.rs` and
+`src/settings/mod.rs`.
+
+---
+
+## Remaining upstream issuer-purpose limitation
+
+The integrated Rust-native path rejects non-CA delegation, enforces presented
+issuer CA/keyCertSign/path-length constraints and checks intermediate validity.
+Explicit manifest/TSA trust lists also remain separate. These protections do
+not enforce a presented issuing CA's declared EKU purpose, or the declared
+purpose of an issuing anchor omitted from the presented chain. Integration
+regressions retain the expected rejections for media-only CAs authorizing
+timestamps and timestamp-only CAs authorizing capture. Those cases remain open;
+the version upgrade is not their closure, and no local PKIX replacement or
+exceptional certificate patch is included.
