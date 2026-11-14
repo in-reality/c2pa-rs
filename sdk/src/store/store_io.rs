@@ -939,7 +939,6 @@ impl Store {
                     intermediate_stream = temp_stream;
                 }
                 pc.add_assertion(&bmff_hash)?;
-
             }
 
             // 3) Generate in memory CAI jumbf block

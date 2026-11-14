@@ -546,8 +546,13 @@ impl Default for Core {
 impl SettingsValidate for Core {
     fn validate(&self) -> Result<()> {
         const MAX_MANIFEST_SIZE_MB: usize = 1024; // 1 GiB
-        if self.max_decompressed_store_size_in_mb.is_some_and(|n| n > MAX_MANIFEST_SIZE_MB) {
-            return Err(Error::BadParam("max_decompressed_store_size_in_mb must not exceed 1024 MB".into()));
+        if self
+            .max_decompressed_store_size_in_mb
+            .is_some_and(|n| n > MAX_MANIFEST_SIZE_MB)
+        {
+            return Err(Error::BadParam(
+                "max_decompressed_store_size_in_mb must not exceed 1024 MB".into(),
+            ));
         }
         if self.max_decompressed_manifest_size_in_mb > MAX_MANIFEST_SIZE_MB {
             return Err(Error::BadParam(format!(
@@ -1473,7 +1478,9 @@ pub fn with_decompressed_store_limit(
     struct Restore(Option<Value>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            if let Some(previous) = self.0.take() { SETTINGS.set(previous); }
+            if let Some(previous) = self.0.take() {
+                SETTINGS.set(previous);
+            }
         }
     }
     let previous = SETTINGS.with_borrow(Value::clone);
@@ -2246,21 +2253,48 @@ pub mod tests {
     #[test]
     fn aggregate_scope_restores_success_error_unwind_and_nested() {
         let before = SETTINGS.with_borrow(Value::clone);
-        assert_eq!(Settings::default().core.max_decompressed_store_size_in_mb, None);
+        assert_eq!(
+            Settings::default().core.max_decompressed_store_size_in_mb,
+            None
+        );
         with_decompressed_store_limit(16, || {
-            assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(16));
+            assert_eq!(
+                get_thread_local_settings()
+                    .core
+                    .max_decompressed_store_size_in_mb,
+                Some(16)
+            );
             with_decompressed_store_limit(8, || {
-                assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(8));
+                assert_eq!(
+                    get_thread_local_settings()
+                        .core
+                        .max_decompressed_store_size_in_mb,
+                    Some(8)
+                );
                 Ok(())
             })?;
-            assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(16));
-            let nested_error = with_decompressed_store_limit(4, || Err(Error::BadParam("synthetic".into())));
+            assert_eq!(
+                get_thread_local_settings()
+                    .core
+                    .max_decompressed_store_size_in_mb,
+                Some(16)
+            );
+            let nested_error =
+                with_decompressed_store_limit(4, || Err(Error::BadParam("synthetic".into())));
             assert!(nested_error.is_err());
-            assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(16));
+            assert_eq!(
+                get_thread_local_settings()
+                    .core
+                    .max_decompressed_store_size_in_mb,
+                Some(16)
+            );
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(SETTINGS.with_borrow(Value::clone), before);
-        assert!(with_decompressed_store_limit(16, || Err(Error::BadParam("synthetic".into()))).is_err());
+        assert!(
+            with_decompressed_store_limit(16, || Err(Error::BadParam("synthetic".into()))).is_err()
+        );
         assert_eq!(SETTINGS.with_borrow(Value::clone), before);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_decompressed_store_limit(16, || panic!("synthetic unwind"))
@@ -2268,7 +2302,11 @@ pub mod tests {
         assert!(caught.is_err());
         assert_eq!(SETTINGS.with_borrow(Value::clone), before);
         let called = std::cell::Cell::new(false);
-        assert!(with_decompressed_store_limit(1025, || { called.set(true); Ok(()) }).is_err());
+        assert!(with_decompressed_store_limit(1025, || {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
         assert!(!called.get());
         assert_eq!(SETTINGS.with_borrow(Value::clone), before);
     }
@@ -2287,11 +2325,22 @@ pub mod tests {
             handles.push(thread::spawn(move || {
                 let before = SETTINGS.with_borrow(Value::clone);
                 let result = with_decompressed_store_limit(limit, || {
-                    tx.send((limit, get_thread_local_settings().core.max_decompressed_store_size_in_mb))
-                        .map_err(|_| Error::BadParam("synthetic channel".into()))?;
-                    release_rx.recv_timeout(Duration::from_secs(5))
+                    tx.send((
+                        limit,
+                        get_thread_local_settings()
+                            .core
+                            .max_decompressed_store_size_in_mb,
+                    ))
+                    .map_err(|_| Error::BadParam("synthetic channel".into()))?;
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
                         .map_err(|_| Error::BadParam("synthetic bounded release".into()))?;
-                    assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(limit));
+                    assert_eq!(
+                        get_thread_local_settings()
+                            .core
+                            .max_decompressed_store_size_in_mb,
+                        Some(limit)
+                    );
                     Ok(())
                 });
                 assert_eq!(SETTINGS.with_borrow(Value::clone), before);
@@ -2301,13 +2350,22 @@ pub mod tests {
         drop(ready_tx);
         // Collect before asserting and release both even on an unexpected observation:
         // failure cannot leave another worker waiting at an unbounded barrier.
-        let observed = (0..2).map(|_| ready_rx.recv_timeout(Duration::from_secs(5))).collect::<Vec<_>>();
+        let observed = (0..2)
+            .map(|_| ready_rx.recv_timeout(Duration::from_secs(5)))
+            .collect::<Vec<_>>();
         let main_during = SETTINGS.with_borrow(Value::clone);
-        for release in releases { let _ = release.send(()); }
-        for handle in handles { handle.join().unwrap().unwrap(); }
+        for release in releases {
+            let _ = release.send(());
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
         assert_eq!(main_during, main_before);
         assert_eq!(SETTINGS.with_borrow(Value::clone), main_before);
-        for row in observed { let (expected, actual) = row.unwrap(); assert_eq!(actual, Some(expected)); }
+        for row in observed {
+            let (expected, actual) = row.unwrap();
+            assert_eq!(actual, Some(expected));
+        }
     }
 
     #[test]
@@ -2315,11 +2373,22 @@ pub mod tests {
         // Negative contract: an off-thread legacy writer would NOT inherit the cap.
         // Actual preparation writer calls must therefore remain synchronous here.
         with_decompressed_store_limit(16, || {
-            let other = std::thread::spawn(|| get_thread_local_settings().core.max_decompressed_store_size_in_mb)
-                .join().unwrap();
+            let other = std::thread::spawn(|| {
+                get_thread_local_settings()
+                    .core
+                    .max_decompressed_store_size_in_mb
+            })
+            .join()
+            .unwrap();
             assert_eq!(other, None);
-            assert_eq!(get_thread_local_settings().core.max_decompressed_store_size_in_mb, Some(16));
+            assert_eq!(
+                get_thread_local_settings()
+                    .core
+                    .max_decompressed_store_size_in_mb,
+                Some(16)
+            );
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 }
