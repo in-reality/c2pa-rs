@@ -163,6 +163,12 @@ pub struct ManifestDefinition {
     #[serde(default = "default_vec::<AssertionDefinition>")]
     pub assertions: Vec<AssertionDefinition>,
 
+    // JSON roundtrips preserve bytes and salt; working-store archives reject
+    // this capability until Reader::into_builder can restore arbitrary boxes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "json_schema", schemars(skip))]
+    data_boxes: Vec<BuilderDataBox>,
+
     /// JUMBF URIs of assertions to redact from ingredient manifests.
     ///
     /// Each URI has the form
@@ -460,6 +466,15 @@ pub struct Builder {
     // Accumulator to assist with hashing mdat bytes for BmffHash assertions.
     #[serde(skip)]
     bmff_hasher: MerkleAccumulator,
+}
+
+// The salt is retained explicitly: HashedUri intentionally omits it from serde.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BuilderDataBox {
+    uri: HashedUri,
+    salt: Option<Vec<u8>>,
+    data: crate::assertions::DataBox,
+    claim_version: u8,
 }
 
 impl AsRef<Builder> for Builder {
@@ -1410,6 +1425,64 @@ impl Builder {
         Ok(self)
     }
 
+    /// Adds binary data through the standard C2PA databox mechanism and returns
+    /// its salted JUMBF box hash (not a hash of the encoded payload).
+    ///
+    /// The actual claim label is frozen on first use. Changing that label, claim
+    /// version or hash algorithm subsequently fails signing, rather than leaving
+    /// stale references. Caller admission must bound `data` before this call.
+    /// Builder JSON retains boxes and salts. JUMBF working-store archives are
+    /// explicitly unsupported for builders using this method.
+    pub fn add_databox(&mut self, format: &str, data: Vec<u8>) -> Result<HashedUri> {
+        let mut claim = match self.definition.label.as_deref() {
+            Some(label) => Claim::new_with_user_guid("", label, self.claim_version().into())?,
+            None => Claim::new(
+                "",
+                self.definition.vendor.as_deref(),
+                self.claim_version().into(),
+            ),
+        };
+        if let Some(alg) = &self.definition.hash_alg {
+            claim.alg = Some(alg.clone());
+        }
+        self.restore_databoxes(&mut claim)?;
+        let uri = claim.add_databox(format, data, None)?;
+        let boxed = claim
+            .databoxes()
+            .last()
+            .ok_or(Error::MissingDataBox)?
+            .1
+            .clone();
+        self.definition.label = Some(claim.label().to_owned());
+        self.definition.data_boxes.push(BuilderDataBox {
+            salt: uri.salt().clone(),
+            uri: uri.clone(),
+            data: boxed,
+            claim_version: self.claim_version(),
+        });
+        Ok(uri)
+    }
+
+    fn restore_databoxes(&self, claim: &mut Claim) -> Result<()> {
+        for pending in &self.definition.data_boxes {
+            let uri = pending.uri.url();
+            if manifest_label_from_uri(&uri).as_deref() != Some(claim.label())
+                || usize::from(pending.claim_version) != claim.version()
+                || pending.uri.alg().as_deref() != Some(claim.alg())
+            {
+                return Err(Error::BadParam("databox claim context changed".into()));
+            }
+            let label = uri.rsplit('/').next().ok_or(Error::MissingDataBox)?;
+            let cbor = c2pa_cbor::to_vec(&pending.data)
+                .map_err(|e| Error::AssertionEncoding(e.to_string()))?;
+            claim.put_databox(label, &cbor, pending.salt.clone())?;
+            if claim.databoxes().last().map(|(uri, _)| uri.hash()) != Some(pending.uri.hash()) {
+                return Err(Error::BadParam("databox box hash changed".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Unpacks an archive stream into a Builder.
     ///
     /// # Arguments
@@ -1724,6 +1797,13 @@ impl Builder {
             ),
         }
         .with_context(self.context.clone());
+
+        if !definition.data_boxes.is_empty() {
+            if let Some(alg) = &definition.hash_alg {
+                claim.alg = Some(alg.clone());
+            }
+            self.restore_databoxes(&mut claim)?;
+        }
 
         // add claim generator info to claim and resolve icons
         for info in &claim_generator_info {
@@ -3862,6 +3942,11 @@ impl Builder {
     /// IMPORTANT: This certificate is useful only in a private context and will
     /// not be considered trusted in the C2PA conformance sense.
     fn working_store_sign(&self, kind: ArchiveKind) -> Result<Vec<u8>> {
+        if !self.definition.data_boxes.is_empty() {
+            return Err(Error::BadParam(
+                "databox builders do not support JUMBF working-store archives".into(),
+            ));
+        }
         // First we need to generate a `BoxHash` over an empty string.
         let mut empty_asset = std::io::Cursor::new("");
 
@@ -13362,5 +13447,89 @@ mod tests {
         assert!(has(results.failure(), SIGNING_CREDENTIAL_REVOKED));
         assert!(!has(results.success(), SIGNING_CREDENTIAL_TRUSTED));
         assert!(!has(results.success(), CLAIM_SIGNATURE_VALIDATED));
+    }
+}
+
+#[cfg(test)]
+mod databox_builder_tests {
+    use super::*;
+
+    #[test]
+    fn signed_file_retains_exact_salted_databox_hashes() {
+        let context = Context::new()
+            .with_settings(serde_json::json!({
+                "verify":{"verify_after_sign":false},"builder":{"thumbnail":{"enabled":false}}
+            }))
+            .unwrap();
+        let mut builder = Builder::from_context(context);
+        let first = builder.add_databox("image/png", vec![0, 1, 2]).unwrap();
+        let second = builder.add_databox("video/mp4", vec![3, 4, 5]).unwrap();
+        builder
+            .add_created_assertion(
+                "org.example.resources",
+                &vec![first.clone(), second.clone()],
+            )
+            .unwrap();
+        let signer = crate::utils::test_signer::test_signer(crate::SigningAlg::Es256);
+        let mut dest = std::io::Cursor::new(Vec::new());
+        builder
+            .sign(
+                signer.as_ref(),
+                "image/jpeg",
+                &mut std::io::Cursor::new(include_bytes!("../tests/fixtures/C.jpg")),
+                &mut dest,
+            )
+            .unwrap();
+        let reader = Reader::from_context(Context::new())
+            .with_stream("image/jpeg", dest)
+            .unwrap();
+        let claim = reader
+            .store
+            .get_claim(reader.active_label().unwrap())
+            .unwrap();
+        assert_eq!(claim.get_databox(&first).unwrap().data, [0, 1, 2]);
+        assert_eq!(claim.get_databox(&second).unwrap().data, [3, 4, 5]);
+        let mut wrong = first.clone();
+        wrong.update_hash(vec![0; 32]);
+        assert!(claim.get_databox(&wrong).is_none());
+    }
+
+    #[test]
+    fn databoxes_keep_native_hashes_salts_and_claim_identity() {
+        let mut builder = Builder::default();
+        let first = builder.add_databox("image/png", vec![0, 1, 2]).unwrap();
+        let second = builder.add_databox("video/mp4", vec![3, 4, 5]).unwrap();
+        assert_ne!(first.url(), second.url());
+        let claim = builder.to_claim().unwrap();
+        assert_eq!(claim.get_databox(&first).unwrap().data, [0, 1, 2]);
+        assert_eq!(claim.get_databox(&second).unwrap().data, [3, 4, 5]);
+        let restored: Builder =
+            serde_json::from_slice(&serde_json::to_vec(&builder).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .to_claim()
+                .unwrap()
+                .get_databox(&first)
+                .unwrap()
+                .data,
+            [0, 1, 2]
+        );
+        let via_definition = Builder::from_context(Context::new())
+            .with_definition(serde_json::to_value(&builder).unwrap())
+            .unwrap();
+        assert!(via_definition
+            .to_claim()
+            .unwrap()
+            .get_databox(&first)
+            .is_some());
+        assert!(restored.working_store_sign(ArchiveKind::Builder).is_err());
+        builder.definition.hash_alg = Some("sha384".into());
+        assert!(builder.to_claim().is_err());
+        builder.definition.hash_alg = None;
+        builder.definition.claim_version = Some(1);
+        assert!(builder.to_claim().is_err());
+        builder.definition.claim_version = None;
+        builder.definition.label = None;
+        assert!(builder.to_claim().is_err());
     }
 }

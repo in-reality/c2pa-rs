@@ -276,3 +276,26 @@ regressions retain the expected rejections for media-only CAs authorizing
 timestamps and timestamp-only CAs authorizing capture. Those cases remain open;
 the version upgrade is not their closure, and no local PKIX replacement or
 exceptional certificate patch is included.
+
+## Additive Builder databox resources
+
+**Where:** `sdk/src/builder.rs` (`Builder::add_databox`).
+
+**What:** Exposes the existing standard `Claim::add_databox` / `put_databox`
+path to Builder callers. Payloads use native CBOR byte strings in the C2PA
+`c2pa.databoxes` store; the returned SDK `HashedUri` hashes the salted JUMBF
+box, independently of a caller's encoded-payload digest. This is the established
+databox mechanism, not the newer EmbeddedData assertion representation.
+The actual generated claim label is pinned on first use; subsequent label,
+claim-version or hash-algorithm changes fail. Boxes are restored before icons
+and ingredients allocate further databox IDs. Builder JSON retains the data,
+identity and explicit salt. JUMBF working-store archive emission rejects this
+capability because Reader::into_builder does not yet restore arbitrary boxes;
+no archive roundtrip is claimed.
+
+**Why:** A custom signed descriptor must reference actual native binary boxes
+before the normal final signing/hash step. Builder::add_resource only registers
+source bytes, and generic add_assertion serializes custom CBOR assertions;
+neither provides this mechanism. Upstream main checked 2026-11-16 still lacks
+a public arbitrary Builder databox API. Remove this adapter when upstream
+provides an equivalent pre-sign API preserving exact salted references.
