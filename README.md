@@ -136,3 +136,29 @@ We welcome contributions to this project. For information on contributing, provi
 The `c2pa` crate is distributed under the terms of both the [MIT license](https://github.com/contentauth/c2pa-rs/blob/main/LICENSE-MIT) and the [Apache License (Version 2.0)](https://github.com/contentauth/c2pa-rs/blob/main/LICENSE-APACHE).
 
 Some components and dependent crates are licensed under different terms; please check their licenses for details.
+
+
+### Local raw reading boundary
+
+`Reader::raw_manifest(label)` is a narrow immutable fork API for complete generic
+reading. It borrows original claim CBOR, original signature-box payload and every
+assertion instance with its exact payload/encoding/URI and original box-domain
+metadata, including unfamiliar CBOR/JSON/binary/UUID assertions. Missing original
+claim bytes are an explicit error; it never reserializes a typed Claim to create
+signed evidence. Original created/gathered references and unknown claim metadata
+remain in the original claim CBOR. The API exposes no mutable Store/Claim and
+changes no validation/trust behavior.
+
+Upstream Reader's current public report/Manifest projections can erase CBOR
+distinctions or omit binary/UUID assertions; public resource access alone lacks
+complete claim/reference/encoding inventory. Replace this fork API when upstream
+provides equivalent exact original claim, complete raw payload inventory and
+reference-association access. `sdk/tests/raw_reader.rs` uses an existing signed
+SDK fixture; raw-module unit tests exercise absent original bytes and synthetic
+inventory-only binary/UUID entries without claiming historical signer evidence.
+
+The raw boundary also emits a single original reference inventory (collection,
+array index, unchanged URL and SDK-normalized syntactic target URI). Each URI is
+normalized once rather than scanning all references for every assertion. Consumers
+can index those records while retaining the complete original claim/reference
+bytes and source order; normalization itself establishes no target authentication.

@@ -14,6 +14,9 @@
 //! The Reader provides a way to read a manifest store from an asset.
 //! It also performs validation on the manifest store.
 
+mod raw;
+pub use raw::{RawAssertion, RawAssertionKind, RawManifest, RawReference, RawReferenceCollection};
+
 #[cfg(feature = "file_io")]
 use std::fs::{read, File};
 use std::{
