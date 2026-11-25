@@ -279,7 +279,7 @@ pub use ingredient::Ingredient;
 pub use manifest::{Manifest, SignatureInfo};
 pub use manifest_assertion::{ManifestAssertion, ManifestAssertionKind};
 pub use merkle_utils::{compute_merkle_proof, compute_merkle_root};
-pub use reader::Reader;
+pub use reader::{AssetBinding, AssetBindingKind, AssetBindingValidation, Reader};
 #[doc(inline)]
 pub use resource_store::{ResourceRef, ResourceStore};
 #[doc(inline)]

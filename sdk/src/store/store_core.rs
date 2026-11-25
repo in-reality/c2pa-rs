@@ -1906,6 +1906,11 @@ impl Store {
 
     // get the manifest that should be used for hash binding checks
     pub(super) fn get_hash_binding_manifest(&self, claim: &Claim) -> Option<String> {
+        self.get_hash_binding_manifest_path(claim)
+            .and_then(|path| path.last().cloned())
+    }
+
+    pub(crate) fn get_hash_binding_manifest_path(&self, claim: &Claim) -> Option<Vec<String>> {
         self.get_hash_binding_manifest_impl(claim, &mut HashSet::new())
     }
 
@@ -1913,7 +1918,7 @@ impl Store {
         &self,
         claim: &Claim,
         visited: &mut HashSet<String>,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         if !visited.insert(claim.label().to_owned()) {
             // A cyclic chain has no binding manifest.
             // None maps to a validation error in this case.
@@ -1922,7 +1927,7 @@ impl Store {
 
         // is this claim valid
         if !claim.update_manifest() && !claim.hash_assertions().is_empty() {
-            return Some(claim.label().to_owned());
+            return Some(vec![claim.label().to_owned()]);
         }
 
         // walk the update manifests until you find an acceptable claim
@@ -1934,9 +1939,11 @@ impl Store {
                     if let Some(parent) = self.get_claim(&parent_label) {
                         // recurse until we find
                         if parent.update_manifest() {
-                            return self.get_hash_binding_manifest_impl(parent, visited);
+                            let mut path = self.get_hash_binding_manifest_impl(parent, visited)?;
+                            path.insert(0, claim.label().to_owned());
+                            return Some(path);
                         } else if !parent.hash_assertions().is_empty() {
-                            return Some(parent.label().to_owned());
+                            return Some(vec![claim.label().to_owned(), parent.label().to_owned()]);
                         }
                     }
                 }

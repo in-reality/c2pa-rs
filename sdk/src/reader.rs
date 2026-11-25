@@ -49,6 +49,79 @@ use crate::{
     Ingredient, Manifest, ManifestAssertion, ManifestAssertionKind,
 };
 
+/// Standard asset-binding family selected by the SDK, excluding part hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AssetBindingKind {
+    /// A byte-range data hash.
+    Data,
+    /// A versioned ISO BMFF hash.
+    Bmff,
+    /// A container box hash.
+    Boxes,
+    /// A collection of files.
+    Collection,
+}
+
+impl AssetBindingKind {
+    /// The affirmative status emitted by SDK verification of this family.
+    pub fn match_code(self) -> &'static str {
+        use crate::validation_status::*;
+        match self {
+            Self::Data => ASSERTION_DATAHASH_MATCH,
+            Self::Bmff => ASSERTION_BMFFHASH_MATCH,
+            Self::Boxes => ASSERTION_BOXHASH_MATCH,
+            Self::Collection => ASSERTION_COLLECTIONHASH_MATCH,
+        }
+    }
+
+    /// Whether a status describes any standard binding family.
+    pub fn is_binding_status(code: &str) -> bool {
+        [Self::Data, Self::Bmff, Self::Boxes, Self::Collection]
+            .iter()
+            .any(|kind| kind.contains_status(code))
+    }
+
+    /// Whether a status describes verification of this binding family.
+    pub fn contains_status(self, code: &str) -> bool {
+        code.starts_with(self.match_code().strip_suffix("match").unwrap())
+    }
+}
+
+/// Current verification of the selected signed assertion, never recorded history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetBindingValidation {
+    /// The current read emitted an exact affirmative binding check.
+    Passed,
+    /// The current read emitted a binding failure at the exact assertion URI.
+    Failed,
+    /// No affirmative check was performed or completed for that assertion.
+    NotChecked,
+}
+
+/// SDK-selected binding identity and signed projection. Selection alone proves
+/// neither authenticity, trust, account rights nor availability of source bytes.
+#[derive(Debug, Clone)]
+pub struct AssetBinding {
+    /// Claim owning the binding, which may be an update manifest's ancestor.
+    pub claim_label: String,
+    /// Actual SDK selection path, from the requested claim through any updates
+    /// to the owning claim. These declarations still require authentication.
+    pub claim_path: Vec<String>,
+    /// Exact versioned assertion label including its instance suffix.
+    pub assertion_label: String,
+    /// SDK assertion instance number, independent of assertion version.
+    pub instance: usize,
+    /// Effective fallback algorithm used by the SDK. Boxes and collections can
+    /// override it per entry; those overrides remain in `assertion`.
+    pub algorithm: String,
+    /// SDK-decoded signed assertion; not a whole-file digest or rewritten CBOR.
+    pub assertion: Value,
+    /// Standard family selected by `Claim::hash_assertions`.
+    pub kind: AssetBindingKind,
+    /// Current read's outcome at this exact binding assertion.
+    pub validation: AssetBindingValidation,
+}
+
 /// MaybeSend allows for no Send bound on wasm32 targets
 /// todo: move this to a common module
 #[cfg(not(target_arch = "wasm32"))]
@@ -904,6 +977,107 @@ impl Reader {
         Ok(identity)
     }
 
+    /// Expose the same binding-claim resolver and assertion selection used by
+    /// asset verification, including update inheritance and created/gathered
+    /// distinctions. Missing or conflicting bindings are errors. This accessor
+    /// does not validate bytes, authenticate an update link, or promote recorded
+    /// ingredient results; `NotChecked` includes store-only/disabled verification.
+    pub fn selected_asset_binding(&self, label: &str) -> Result<AssetBinding> {
+        use crate::{
+            assertion::AssertionBase,
+            assertions::{BmffHash, DataHash},
+            status_tracker::LogKind,
+        };
+        let source = self
+            .store
+            .get_claim(label)
+            .ok_or_else(|| Error::ResourceNotFound(label.to_owned()))?;
+        let claim_path = self
+            .store
+            .get_hash_binding_manifest_path(source)
+            .ok_or(Error::ClaimMissingHardBinding)?;
+        let binding_label = claim_path
+            .last()
+            .cloned()
+            .ok_or(Error::ClaimMissingHardBinding)?;
+        let claim = self
+            .store
+            .get_claim(&binding_label)
+            .ok_or(Error::ClaimMissingHardBinding)?;
+        let bindings = claim.hash_assertions();
+        let binding = match bindings.as_slice() {
+            [binding] => *binding,
+            [] => return Err(Error::ClaimMissingHardBinding),
+            _ => return Err(Error::ClaimMultipleHardBinding),
+        };
+        let raw = binding.assertion();
+        let decode_error = |error| match error {
+            Error::AssertionDecoding(ref error)
+                if matches!(
+                    error.source,
+                    crate::assertion::AssertionDecodeErrorCause::AssertionTooNew { .. }
+                ) =>
+            {
+                Error::UnsupportedType
+            }
+            error => error,
+        };
+        let (kind, algorithm) = match raw.label_root().as_str() {
+            crate::assertions::labels::DATA_HASH => (
+                AssetBindingKind::Data,
+                DataHash::from_assertion(raw)
+                    .map_err(decode_error)?
+                    .alg
+                    .unwrap_or_else(|| claim.alg().to_owned()),
+            ),
+            crate::assertions::labels::BMFF_HASH => (
+                AssetBindingKind::Bmff,
+                BmffHash::from_assertion(raw)
+                    .map_err(decode_error)?
+                    .alg()
+                    .cloned()
+                    .unwrap_or_else(|| claim.alg().to_owned()),
+            ),
+            crate::assertions::labels::BOX_HASH => {
+                (AssetBindingKind::Boxes, claim.alg().to_owned())
+            }
+            crate::assertions::labels::COLLECTION_HASH => {
+                (AssetBindingKind::Collection, claim.alg().to_owned())
+            }
+            _ => return Err(Error::UnsupportedType),
+        };
+        let uri = claim.assertion_uri(&binding.label());
+        let rows: Vec<_> = self
+            .current_validation_status()
+            .unwrap_or_default()
+            .iter()
+            .filter(|status| {
+                status.url() == Some(uri.as_str())
+                    && AssetBindingKind::is_binding_status(status.code())
+            })
+            .collect();
+        let validation = if rows.iter().any(|s| *s.kind() == LogKind::Failure) {
+            AssetBindingValidation::Failed
+        } else if rows
+            .iter()
+            .any(|s| *s.kind() == LogKind::Success && s.code() == kind.match_code())
+        {
+            AssetBindingValidation::Passed
+        } else {
+            AssetBindingValidation::NotChecked
+        };
+        Ok(AssetBinding {
+            claim_label: binding_label,
+            claim_path,
+            assertion_label: binding.label(),
+            instance: binding.instance(),
+            algorithm,
+            assertion: raw.as_json_object()?,
+            kind,
+            validation,
+        })
+    }
+
     /// Write a resource identified by URI to the given stream.
     /// Use this function, for example, to get a thumbnail or icon image and write it to a stream.
     /// # Arguments
@@ -1388,6 +1562,116 @@ pub mod tests {
         utils::{test::test_context, test_signer::test_signer},
         Builder, SigningAlg,
     };
+
+    #[test]
+    fn selected_asset_binding_preserves_sdk_selection_and_exact_current_scope() -> Result<()> {
+        use crate::{
+            assertion::AssertionBase,
+            assertions::{DataHash, UserCbor},
+            claim::{Claim, ClaimAssertion, ClaimAssertionType},
+            status_tracker::LogKind,
+        };
+        let make = |created: usize, gathered: bool| -> Result<Reader> {
+            let mut claim = Claim::new("binding projection test", None, 2);
+            claim.add_claim_generator_info(crate::ClaimGeneratorInfo::new(
+                "binding projection test",
+            ));
+            let mut hash = DataHash::new("asset", "sha256");
+            hash.hash = vec![42; 32];
+            hash.alg = None; // The SDK falls back to the owning claim algorithm.
+            for instance in 1..=created {
+                claim.put_assertion_store(ClaimAssertion::new(
+                    hash.to_assertion()?,
+                    instance,
+                    &[],
+                    "sha256",
+                    None,
+                    ClaimAssertionType::Created,
+                ));
+            }
+            if gathered {
+                claim.put_assertion_store(ClaimAssertion::new(
+                    hash.to_assertion()?,
+                    0,
+                    &[],
+                    "sha256",
+                    None,
+                    ClaimAssertionType::Gathered,
+                ));
+            }
+            for label in ["c2pa.hash.data.part", "c2pa.hash.multi-asset"] {
+                let part = UserCbor::new(label, c2pa_cbor::to_vec(&hash)?);
+                claim.put_assertion_store(ClaimAssertion::new(
+                    part.to_assertion()?,
+                    0,
+                    &[],
+                    "sha256",
+                    None,
+                    ClaimAssertionType::Created,
+                ));
+            }
+            let mut store = Store::new();
+            store.commit_claim(claim)?;
+            Ok(Reader {
+                store: Arc::new(store),
+                ..Default::default()
+            })
+        };
+        let mut reader = make(1, true)?;
+        let label = reader.store.provenance_claim().unwrap().label().to_owned();
+        let selected = reader.selected_asset_binding(&label)?;
+        assert_eq!(selected.claim_path, vec![label.clone()]);
+        assert_eq!(selected.assertion_label, "c2pa.hash.data__1");
+        assert_eq!(selected.instance, 1);
+        assert_eq!(selected.algorithm, "sha256");
+        assert_eq!(selected.kind, AssetBindingKind::Data);
+        assert_eq!(selected.validation, AssetBindingValidation::NotChecked);
+        let uri = format!(
+            "self#jumbf=/c2pa/{label}/c2pa.assertions/{}",
+            selected.assertion_label
+        );
+        reader.current_validation_status = Some(vec![
+            ValidationStatus::new("assertion.dataHash.match").set_url(uri.replace("__1", "")),
+            ValidationStatus::new("assertion.dataHash.additionalExclusionsPresent")
+                .set_url(&uri)
+                .set_kind(LogKind::Informational),
+        ]);
+        assert_eq!(
+            reader.selected_asset_binding(&label)?.validation,
+            AssetBindingValidation::NotChecked
+        );
+        reader
+            .current_validation_status
+            .as_mut()
+            .unwrap()
+            .push(ValidationStatus::new("assertion.dataHash.match").set_url(&uri));
+        assert_eq!(
+            reader.selected_asset_binding(&label)?.validation,
+            AssetBindingValidation::Passed
+        );
+        reader
+            .current_validation_status
+            .as_mut()
+            .unwrap()
+            .push(ValidationStatus::new_failure("assertion.dataHash.mismatch").set_url(&uri));
+        assert_eq!(
+            reader.selected_asset_binding(&label)?.validation,
+            AssetBindingValidation::Failed
+        );
+        assert!(reader.selected_asset_binding("missing").is_err());
+        let missing = make(0, true)?;
+        assert!(matches!(
+            missing.selected_asset_binding(missing.store.provenance_claim().unwrap().label()),
+            Err(Error::ClaimMissingHardBinding)
+        ));
+        let conflicting = make(2, false)?;
+        assert!(matches!(
+            conflicting
+                .selected_asset_binding(conflicting.store.provenance_claim().unwrap().label()),
+            Err(Error::ClaimMultipleHardBinding)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn test_reader_rejects_truncated_box_hash_list() -> Result<()> {

@@ -299,3 +299,29 @@ source bytes, and generic add_assertion serializes custom CBOR assertions;
 neither provides this mechanism. Upstream main checked 2026-11-16 still lacks
 a public arbitrary Builder databox API. Remove this adapter when upstream
 provides an equivalent pre-sign API preserving exact salted references.
+
+
+## Reader: SDK-selected asset binding
+
+**Where:** `sdk/src/reader.rs`, `sdk/src/store/store_core.rs`, `sdk/src/lib.rs`.
+
+**What:** `Reader::selected_asset_binding(label)` exposes the existing SDK
+binding resolver and `Claim::hash_assertions` selection, including update
+inheritance, created-versus-gathered filtering, exact version/instance labels,
+effective algorithm and signed assertion projection. The resolver now retains
+its actual claim path; the verifier still consumes the same selected endpoint.
+The typed family supplies its positive status vocabulary. The current result
+requires a success at the exact selected assertion URI, with scoped failures
+winning; informational or historical statuses cannot supply that success.
+Missing/conflicting selection is an error. Selection is not authentication or
+source availability. Boxes/collections retain per-entry algorithm overrides.
+
+**Why:** Compound assets contain part hashes and supporting multi-asset maps.
+Reader's compact assertions omit some standard bindings; prefix-counting detailed
+JSON or rewalking updates in consumers cannot reproduce the SDK's selection.
+Consumers can now retain their trust/account/continuity policies over SDK facts.
+Remove this accessor when an upstream typed Reader API provides the same exact
+selection and current-result scope. Focused selector defenses are in Reader's
+`selected_asset_binding_preserves_sdk_selection_and_exact_current_scope` test;
+Core integration tests exercise ordinary containers, updates and the exact
+owned Pixel compound assets.
