@@ -345,3 +345,33 @@ selection and current-result scope. Focused selector defenses are in Reader's
 `selected_asset_binding_preserves_sdk_selection_and_exact_current_scope` test;
 Core integration tests exercise ordinary containers, updates and the exact
 owned Pixel compound assets.
+
+
+## Reader: original selected claim and COSE material
+
+**Where:** `sdk/src/reader.rs`, `claim/claim_core.rs`,
+`store/store_core.rs` and `crypto/cose/sign1.rs`.
+
+**What:** `Reader::claim_material(label)` exposes the existing parsed Store's
+original imported CBOR, original COSE envelope, original uncompressed manifest
+box and SDK compression flag, without verification authority. Missing original
+bytes/labels refuse; locally reconstructed/JSON fields cannot fabricate them.
+The existing original-data/signature retention and Store selector remain the
+source. Store parsing additionally rejects repeated manifest labels and multiple
+signature payloads before they can silently collapse to one selected identity.
+`parse_cose_sign1_original` uses the existing coset decoder without replacing the
+attached payload; the normal verification parser retains its tagged detached
+verification behavior. Certificate extraction reuses `cert_chain_from_sign1`; its legacy unprotected
+header fallback now recognizes registered integer label 33 as well as text
+`x5chain`, matching its protected-header handling and the replaced host inputs.
+Chains declared in both headers remain refused. This restores credential
+candidate compatibility, without treating an unprotected chain as authority.
+
+**Why:** Backend issuance requires a hash of verbatim claim bytes, while
+credential lookup needs untrusted DER candidates. Display JSON and the
+verification helper's supplied payload cannot preserve these identities.
+The inspected public Reader/COSE surface has no equivalent original-material
+accessor. Remove these additive APIs when upstream exposes the same retained
+bytes and exact selection/ambiguity contract. Hosts retain complete-envelope,
+depth/resource and compressed-format admission policy. No expanded format,
+source authorization, trust or certificate-purpose qualification is implied.

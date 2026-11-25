@@ -2008,6 +2008,16 @@ impl Claim {
         }
     }
 
+    pub(crate) fn original_manifest_data(&self) -> Option<&[u8]> {
+        self.original_manifest
+            .as_ref()
+            .map(|(bytes, _)| bytes.as_ref())
+    }
+
+    pub(crate) fn original_data(&self) -> Option<&[u8]> {
+        self.original_bytes.as_deref()
+    }
+
     pub(crate) fn remember_manifest(&mut self, bytes: &[u8], normalized_hash: Vec<u8>) {
         self.original_manifest = Some((Arc::from(bytes), normalized_hash));
     }

@@ -1435,6 +1435,12 @@ impl Store {
                 ))?
                 .desc_box;
 
+            // A lossless signature selection cannot discard a second payload.
+            if sig_superbox.data_box_count() != 1 {
+                return Err(Error::InvalidClaim(
+                    InvalidClaimError::C2paMultipleManifestBoxes,
+                ));
+            }
             // check box contents
             if sig_desc_box.uuid() == CAI_SIGNATURE_UUID {
                 // better be, but just in case...
@@ -1619,6 +1625,13 @@ impl Store {
                 ),
             );
 
+            // Never silently replace a same-label manifest: selected material and
+            // manifest-box identity must refer to one unambiguous original box.
+            if store.get_claim(claim.label()).is_some() {
+                return Err(Error::InvalidClaim(
+                    InvalidClaimError::C2paMultipleManifestBoxes,
+                ));
+            }
             // add claim to store
             store.insert_restored_claim(cai_store_desc_box.label(), claim);
         }

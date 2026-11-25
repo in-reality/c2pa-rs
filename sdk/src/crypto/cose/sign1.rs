@@ -16,7 +16,7 @@ use c2pa_raw_crypto::SigningAlg;
 use coset::{
     cbor::value::Value,
     iana::{self, Algorithm, EnumI64},
-    CoseSign1, Label, RegisteredLabelWithPrivate, TaggedCborSerializable,
+    CborSerializable, CoseSign1, Label, RegisteredLabelWithPrivate, TaggedCborSerializable,
 };
 
 use crate::{
@@ -27,6 +27,18 @@ use crate::{
     status_tracker::StatusTracker,
     validation_results::validation_codes::CLAIM_SIGNATURE_MISMATCH,
 };
+
+/// Inspect an original COSE envelope without replacing its attached payload.
+///
+/// Accepts tagged Sign1 and the legacy untagged representation. The CBOR
+/// decoder requires full consumption and rejects duplicate header labels.
+/// This performs no signature, certificate, timestamp or trust verification;
+/// use `parse_cose_sign1` for the verifier's detached-payload handling.
+pub fn parse_cose_sign1_original(cose_bytes: &[u8]) -> Result<CoseSign1, CoseError> {
+    CoseSign1::from_tagged_slice(cose_bytes)
+        .or_else(|_| CoseSign1::from_slice(cose_bytes))
+        .map_err(|error| CoseError::CborParsingError(error.to_string()))
+}
 
 /// Parse a byte slice as a COSE Sign1 data structure.
 ///
@@ -128,7 +140,9 @@ fn get_unprotected_header_certs(sign1: &coset::CoseSign1) -> Result<Vec<Vec<u8>>
         .rest
         .iter()
         .find_map(|x: &(Label, Value)| {
-            if x.0 == Label::Text("x5chain".to_string()) {
+            if x.0 == Label::Text("x5chain".to_string())
+                || x.0 == Label::Int(iana::HeaderParameter::X5Chain.to_i64())
+            {
                 Some(x.1.clone())
             } else {
                 None
@@ -193,5 +207,54 @@ pub fn signing_time_from_sign1(
         Some(tst_info.gen_time.into())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod original_material_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_chain_labels_preserve_der_and_reject_two_header_chains() {
+        let expected = vec![vec![0x30, 1], vec![0x30, 2]];
+        let value = Value::Array(expected.iter().cloned().map(Value::Bytes).collect());
+        for label in [Label::Int(33), Label::Text("x5chain".into())] {
+            let mut sign1 = CoseSign1::default();
+            sign1.unprotected.rest.push((label, value.clone()));
+            assert_eq!(cert_chain_from_sign1(&sign1).unwrap(), expected);
+            sign1
+                .protected
+                .header
+                .rest
+                .push((Label::Int(33), value.clone()));
+            assert!(matches!(
+                cert_chain_from_sign1(&sign1),
+                Err(CoseError::MultipleSigningCertificateChains)
+            ));
+        }
+    }
+
+    #[test]
+    fn original_payload_is_never_replaced_and_trailing_bytes_are_refused() {
+        // COSE_Sign1([h'', {}, h'010203', h'ff']) and detached equivalent.
+        let attached = [0xd2, 0x84, 0x40, 0xa0, 0x43, 1, 2, 3, 0x41, 0xff];
+        let detached = [0xd2, 0x84, 0x40, 0xa0, 0xf6, 0x41, 0xff];
+        assert_eq!(
+            parse_cose_sign1_original(&attached).unwrap().payload,
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            parse_cose_sign1_original(&attached[1..]).unwrap().payload,
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(parse_cose_sign1_original(&detached).unwrap().payload, None);
+        let checked =
+            parse_cose_sign1(&attached, b"replacement", &mut StatusTracker::default()).unwrap();
+        assert_eq!(checked.payload.as_deref(), Some(b"replacement".as_slice()));
+        let mut trailing = attached.to_vec();
+        trailing.push(0);
+        assert!(parse_cose_sign1_original(&trailing).is_err());
+        assert!(parse_cose_sign1_original(&attached[..attached.len() - 1]).is_err());
+        assert!(parse_cose_sign1_original(&[0xd3, 0x84, 0x40, 0xa0, 0xf6, 0x41, 0xff]).is_err());
     }
 }

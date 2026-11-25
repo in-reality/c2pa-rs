@@ -98,6 +98,20 @@ pub enum AssetBindingValidation {
     NotChecked,
 }
 
+/// Original signed material from one parsed claim, independent of verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimMaterial {
+    /// Exact imported claim CBOR, never a JSON projection or re-encoding.
+    pub claim_cbor: Vec<u8>,
+    /// Exact imported COSE envelope, including its original payload and padding.
+    pub cose_sign1: Vec<u8>,
+    /// Exact imported uncompressed manifest box; unavailable for compressed or
+    /// locally constructed claims. This is distinct from the complete store.
+    pub manifest_box: Option<Vec<u8>>,
+    /// Whether the SDK decoded this claim from a compressed manifest.
+    pub compressed: bool,
+}
+
 /// SDK-selected binding identity and signed projection. Selection alone proves
 /// neither authenticity, trust, account rights nor availability of source bytes.
 #[derive(Debug, Clone)]
@@ -1003,6 +1017,26 @@ impl Reader {
             ));
         }
         Ok(identity)
+    }
+
+    /// Read the original bytes retained by the SDK for an exact claim label.
+    ///
+    /// Missing labels or original bytes are errors. Duplicate manifest labels,
+    /// claim boxes and signature boxes are refused by the Store parser. No
+    /// signature, certificate, binding, trust or source authorization is implied;
+    /// imported Reader JSON cannot supply this material. Hosts still own input
+    /// bounds, complete-envelope checks and compressed-format admission policy.
+    pub fn claim_material(&self, label: &str) -> Result<ClaimMaterial> {
+        let claim = self
+            .store
+            .get_claim(label)
+            .ok_or_else(|| Error::ResourceNotFound(label.to_owned()))?;
+        Ok(ClaimMaterial {
+            claim_cbor: claim.original_data().ok_or(Error::ClaimEncoding)?.to_vec(),
+            cose_sign1: claim.signature_val().clone(),
+            manifest_box: claim.original_manifest_data().map(<[u8]>::to_vec),
+            compressed: claim.compressed(),
+        })
     }
 
     /// Expose the same binding-claim resolver and assertion selection used by
