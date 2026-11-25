@@ -2280,3 +2280,44 @@ impl Claim {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod input_mode_tests {
+    use super::*;
+
+    #[test]
+    fn data_hash_exclusion_boundary_distinguishes_embedded_and_detached() {
+        let manifest = HashRange::new(100, 200);
+        let excludes_content = HashRange::new(100, 201);
+        for embedded in [true, false] {
+            assert!(data_hash_exclusions_match_manifest(&[], None, embedded));
+            assert!(data_hash_exclusions_match_manifest(
+                &[HashRange::new(0, 0)],
+                None,
+                embedded,
+            ));
+            assert!(data_hash_exclusions_match_manifest(
+                &[manifest.clone()],
+                Some(&manifest),
+                embedded,
+            ));
+            assert!(!data_hash_exclusions_match_manifest(
+                &[excludes_content.clone()],
+                Some(&manifest),
+                embedded,
+            ));
+        }
+        // A handler may recover embedded bytes without reporting their physical
+        // range. Separately supplied stores cannot use that embedded fallback.
+        assert!(data_hash_exclusions_match_manifest(
+            &[manifest.clone()],
+            None,
+            true
+        ));
+        assert!(!data_hash_exclusions_match_manifest(
+            &[manifest],
+            None,
+            false
+        ));
+    }
+}

@@ -15,6 +15,26 @@ there is no private certificate-validation backport.
 
 ---
 
+## Reader: explicit store-only verification
+
+**Where:** `sdk/src/reader.rs` (`with_manifest_data` and generated async variant).
+
+**What:** Parse supplied JUMBF with the existing context-aware Store reader,
+then call the normal store verifier without subject media. Signatures, assertions
+and ingredient checks still run; media hashes remain unchecked. The normal
+Reader projection and selected-binding accessor are reused. Callers bound bytes
+before parsing, as for the paired API.
+
+**Why:** A store-only inspection must not hash its own JUMBF as if it were media
+and then discard the resulting failures. Upstream 0.91.11 exposes this combination
+only internally. Remove this wrapper when an equivalent upstream Reader API
+preserves the same store verification and unperformed binding distinction.
+Embedded input continues to use native `with_stream`; paired stores continue to
+use `with_manifest_data_and_stream`. Exclusion-boundary tests preserve their
+existing embedded/detached distinction without changing the verifier.
+
+---
+
 ## Certificate trust type fix
 
 **Where:** `sdk/src/crypto/cose/certificate_trust/openssl.rs`

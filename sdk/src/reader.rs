@@ -541,6 +541,34 @@ impl Reader {
         Ok(self)
     }
 
+    /// Read a binary JUMBF manifest store without subject media.
+    ///
+    /// When read-time verification is enabled, signatures, assertions and
+    /// ingredient relationships are checked by the normal store verifier.
+    /// Asset hashes are not checked: a valid store does not establish media
+    /// integrity. Inspect validation statuses for non-fatal failures and
+    /// [`Self::selected_asset_binding`] for the unchecked binding selection.
+    /// Callers must bound the supplied bytes before parsing. Malformed stores
+    /// or fatal verification errors return an [`Error`].
+    #[async_generic]
+    pub fn with_manifest_data(mut self, c2pa_data: &[u8]) -> Result<Self> {
+        let mut validation_log = StatusTracker::default();
+        let store = Store::from_jumbf_with_context(c2pa_data, &mut validation_log, &self.context)?;
+        if self.context.settings().verify.verify_after_reading {
+            if _sync {
+                Store::verify_store(&store, None, &mut validation_log, &self.context)
+            } else {
+                Store::verify_store_async(&store, None, &mut validation_log, &self.context).await
+            }?;
+        }
+        if _sync {
+            self.with_store(store, &mut validation_log)
+        } else {
+            self.with_store_async(store, &mut validation_log).await
+        }?;
+        Ok(self)
+    }
+
     /// Create a manifest store [`Reader`] from existing `c2pa_data` and a stream.
     /// Use this to validate a remote manifest or a sidecar manifest.
     /// # Arguments
@@ -1562,6 +1590,54 @@ pub mod tests {
         utils::{test::test_context, test_signer::test_signer},
         Builder, SigningAlg,
     };
+
+    #[test]
+    fn store_only_reader_verifies_claims_without_media_hashes() -> Result<()> {
+        let bytes = include_bytes!("../tests/fixtures/CA.jpg");
+        let store = crate::jumbf_io::load_jumbf_from_stream("jpg", &mut Cursor::new(bytes))?;
+        let mut settings = crate::Settings::new();
+        settings.core.allowed_network_hosts = Some(Vec::new());
+        settings.verify.remote_manifest_fetch = false;
+        settings.verify.ocsp_fetch = false;
+        settings.verify.verify_after_reading = true;
+        let reader = Reader::from_context(Context::new().with_settings(settings.clone())?)
+            .with_manifest_data(&store)?;
+        assert!(!reader.is_embedded());
+        assert_eq!(
+            reader
+                .selected_asset_binding(reader.active_label().unwrap())?
+                .validation,
+            AssetBindingValidation::NotChecked,
+        );
+        let statuses = reader.current_validation_status().unwrap();
+        assert!(statuses
+            .iter()
+            .any(|s| s.code() == "claimSignature.validated"));
+        assert!(statuses
+            .iter()
+            .any(|s| s.code() == "assertion.hashedURI.match"));
+        assert!(!statuses.iter().any(|s| [
+            "assertion.dataHash.",
+            "assertion.bmffHash.",
+            "assertion.boxesHash."
+        ]
+        .iter()
+        .any(|prefix| s.code().starts_with(prefix))));
+        settings.verify.verify_after_reading = false;
+        let unchecked = Reader::from_context(Context::new().with_settings(settings)?)
+            .with_manifest_data(&store)?;
+        assert!(unchecked.current_validation_status().is_none());
+        assert_eq!(
+            unchecked
+                .selected_asset_binding(unchecked.active_label().unwrap())?
+                .validation,
+            AssetBindingValidation::NotChecked,
+        );
+        assert!(Reader::default()
+            .with_manifest_data(b"not a store")
+            .is_err());
+        Ok(())
+    }
 
     #[test]
     fn selected_asset_binding_preserves_sdk_selection_and_exact_current_scope() -> Result<()> {
