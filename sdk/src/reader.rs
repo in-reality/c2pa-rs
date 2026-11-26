@@ -1039,6 +1039,42 @@ impl Reader {
         })
     }
 
+    /// Inspect one claim-local databox using the caller's exact salted reference.
+    ///
+    /// Uses the SDK's imported databox hash comparison, without copying payload
+    /// bytes or searching ingredients/other claims. This is reference resolution,
+    /// not signature, asset-binding, trust or application authorization evidence.
+    pub fn resource_reference_len(
+        &self,
+        label: &str,
+        reference: &crate::hashed_uri::HashedUri,
+    ) -> Result<u64> {
+        let claim = self
+            .store
+            .get_claim(label)
+            .ok_or_else(|| Error::ResourceNotFound(label.to_owned()))?;
+        let uri = to_absolute_uri(label, &reference.url());
+        if manifest_label_from_uri(&uri).as_deref() != Some(label) {
+            return Err(Error::ResourceNotFound(uri));
+        }
+        // get_databox normalizes the URL and compares the salted JUMBF hash.
+        // Also retain the effective algorithm, which get_databox does not compare.
+        let stored = claim
+            .databoxes()
+            .iter()
+            .find(|(stored, _)| stored.url() == uri)
+            .ok_or_else(|| Error::ResourceNotFound(uri.clone()))?;
+        if reference.alg().as_deref().unwrap_or(claim.alg())
+            != stored.0.alg().as_deref().unwrap_or(claim.alg())
+        {
+            return Err(Error::ResourceNotFound(uri));
+        }
+        claim
+            .get_databox(reference)
+            .map(|data| data.data.len() as u64)
+            .ok_or_else(|| Error::ResourceNotFound(uri))
+    }
+
     /// Expose the same binding-claim resolver and assertion selection used by
     /// asset verification, including update inheritance and created/gathered
     /// distinctions. Missing or conflicting bindings are errors. This accessor
