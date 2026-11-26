@@ -1996,6 +1996,11 @@ impl Claim {
         self.gathered_assertions.as_ref()
     }
 
+    /// Original bytes only; unlike data(), never serialize an authored claim.
+    pub(crate) fn original_data(&self) -> Option<&[u8]> {
+        self.original_bytes.as_deref()
+    }
+
     /// Return the cbor binary value of the claim data.
     /// If this claim was read from a file, returns the exact byte
     /// sequence that was read from the file. If this claim was
